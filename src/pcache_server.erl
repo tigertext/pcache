@@ -128,14 +128,16 @@ handle_call(stats, _From, #cache{datum_index = DatumIndex} = State) ->
 handle_call(empty, _From, #cache{datum_index = DatumIndex} = State) ->
   AllProcs = ets:tab2list(DatumIndex),
   Pids = [Pid || {_DatumId, Pid} <- AllProcs],
-  [X ! {destroy, self()} || X <- Pids],
+  Ref = make_ref(),
+  [X ! {destroy, Ref, self()} || X <- Pids],
   {reply, ok, State};
 
 handle_call(reap_oldest, _From, #cache{datum_index = DatumIndex} = State) ->
   GetOldest = fun({_Key, Pid, _Size}, {APid, Acc}) ->
-                Pid ! {last_active, self()},
+                Ref = make_ref(),
+                Pid ! {last_active, Ref, self()},
                 receive
-                  {last_active, Pid, LastActive} ->
+                  {last_active, Ref, Pid, LastActive} ->
                     if
                       Acc =< LastActive -> {APid, Acc};
                       true -> {Pid, LastActive}
@@ -146,7 +148,8 @@ handle_call(reap_oldest, _From, #cache{datum_index = DatumIndex} = State) ->
   {OldPid, _LActive} = ets:foldr(GetOldest, {false, {9999,0,0}}, DatumIndex),
   case OldPid of
     false -> no_datum;
-    _ -> OldPid ! {destroy, self()}
+    _ -> Ref = make_ref(),
+         OldPid ! {destroy, Ref, self()}
   end,
   {reply, ok, State};
 
@@ -178,9 +181,10 @@ handle_call(Arbitrary, _From, State) ->
 
 handle_cast({dirty, Id, NewData}, #cache{datum_index = DatumIndex} = State) ->
   case ets:lookup(DatumIndex, Id) of
-    [{Id, Pid, _}] -> Pid ! {new_data, self(), NewData},
+    [{Id, Pid, _}] -> Ref = make_ref(),
+                      Pid ! {new_data, Ref, self(), NewData},
                    receive 
-                     {new_data, Pid, _OldData} -> ok
+                     {new_data, Ref, Pid, _OldData} -> ok
                    after 
                      100 -> fail
                    end;
@@ -190,10 +194,11 @@ handle_cast({dirty, Id, NewData}, #cache{datum_index = DatumIndex} = State) ->
 
 handle_cast({dirty, Id}, #cache{datum_index = DatumIndex, cache_used=Used} = State) ->
   New_Size = case ets:lookup(DatumIndex, Id) of
-    [{Id, Pid, Size}] -> Pid ! {destroy, self()},
+    [{Id, Pid, Size}] -> Ref = make_ref(),
+                         Pid ! {destroy, Ref, self()},
                    receive 
-                     {destroy, Pid, ok} -> ets:delete(DatumIndex, Id), 
-                                           Used - Size
+                     {destroy, Ref, Pid, ok} -> ets:delete(DatumIndex, Id),
+                                                Used - Size
                    after 
                      100 -> Used 
                    end;
@@ -204,9 +209,11 @@ handle_cast({dirty, Id}, #cache{datum_index = DatumIndex, cache_used=Used} = Sta
 handle_cast({generic_dirty, M, F, A}, 
     #cache{datum_index = DatumIndex} = State) ->
   case ets:lookup(DatumIndex, key(M, F, A)) of
-    [{{M, F, A}, Pid, _}] -> Pid ! {destroy, self()},
+    
+    [{{M, F, A}, Pid, _}] -> Ref = make_ref(),
+                             Pid ! {destroy, Ref, self()},
                    receive 
-                     {destroy, Pid, ok} -> ok
+                     {destroy, Ref, Pid, ok} -> ok
                    after 
                      100 -> fail
                    end;
@@ -234,8 +241,8 @@ handle_info({'DOWN', _Ref, process, Pid, _Reason},
   end,
   {noreply, New_State};
 
-handle_info(Info, State) ->
-  io:format("Other info of: ~p~n", [Info]),
+handle_info(_Info, State) ->
+  %% io:format("Other info of: ~p~n", [Info]),
   {noreply, State}.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -249,17 +256,19 @@ key(M, F, A) -> {M, F, A}.
 %% Private
 %% ===================================================================
 get_data(DatumPid) ->
-  DatumPid ! {get, self()},
+  Ref = make_ref(),
+  DatumPid ! {get, Ref, self()},
   receive
-    {get, DatumPid, Data} -> {ok, Data}
+    {get, Ref, DatumPid, Data} -> {ok, Data}
   after
     100  -> {no_data, timeout}
   end.
 
 get_key(DatumPid) ->
-  DatumPid ! {getkey, self()},
+  Ref = make_ref(),
+  DatumPid ! {getkey, Ref, self()},
   receive
-    {getkey, DatumPid, Key} -> {ok, Key}
+    {getkey, Ref, DatumPid, Key} -> {ok, Key}
   after
     100 -> {no_data, timeout}
   end.
@@ -316,41 +325,41 @@ continue_noreset(Datum) ->
 datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
             data = Data, remaining_ttl = TTL} = State) ->
   receive
-    {new_data, Mgr, Replacement} ->
-      Mgr ! {new_data, self(), Data},
+    {new_data, Ref, Mgr, Replacement} ->
+      Mgr ! {new_data, Ref, self(), Data},
       continue(update_data(Replacement, State));
 
-    {InvalidMgrRequest, Mgr, _Other} ->
-      Mgr ! {InvalidMgrRequest, self(), invalid_creator_request},
+    {InvalidMgrRequest, Ref, Mgr, _Other} ->
+      Mgr ! {InvalidMgrRequest, Ref, self(), invalid_creator_request},
       continue(State);
 
-    {get, From} ->
-      From ! {get, self(), Data},
+    {get, Ref, From} ->
+      From ! {get, Ref, self(), Data},
       continue(State);
 
-    {getkey, From} ->
-      From ! {getkey, self(), Key},
+    {getkey, Ref, From} ->
+      From ! {getkey, Ref, self(), Key},
       continue(State);
 
-    {memsize, From} ->
+    {memsize, Ref, From} ->
       Size = case is_binary(Data) of
                true -> {memory, size(Data)};
                   _ -> process_info(self(), memory)
              end,
-      From ! {memsize, self(), Size},
+      From ! {memsize, Ref, self(), Size},
       continue_noreset(State);
 
-    {last_active, From} ->
-      From ! {last_active, self(), LastActive},
+    {last_active, Ref, From} ->
+      From ! {last_active, Ref, self(), LastActive},
       continue(State);
 
-    {destroy, From} ->
-      From ! {destroy, self(), ok},
+    {destroy, Ref, From} ->
+      From ! {destroy, Ref, self(), ok},
       % io:format("destroying ~p with last access of ~p~n", [self(), LastActive]),
       exit(self(), destroy);
 
-    {InvalidRequest, From} ->
-      From ! {InvalidRequest, self(), invalid_request},
+    {InvalidRequest, Ref, From} ->
+      From ! {InvalidRequest, Ref, self(), invalid_request},
       continue(State);
 
     _ -> continue(State)
