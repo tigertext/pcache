@@ -151,7 +151,8 @@ handle_call({rand, Type, Num_Desired}, _From, #cache{datum_index = DatumIndex} =
     Datum_Count = ets:info(DatumIndex, size),
     Indices = [crypto:rand_uniform(1, Datum_Count+1) || _ <- lists:seq(1, Num_Desired)],
     {Rand_Pids, _Last_Pos, []} =
-        ets:foldl(fun({_UseKey, Datum_Pid, _Size}, {Pids, Ets_Item_Pos, Wanted_Pid_Positions}) ->
+        ets:foldl(fun(_Ets_Entry, {Pids, Ets_Item_Pos, []}) -> {Pids, Ets_Item_Pos+1, []};
+                     ({_UseKey, Datum_Pid, _Size}, {Pids, Ets_Item_Pos, Wanted_Pid_Positions}) ->
                           Fetch_Positions = lists:takewhile(fun(Pos) -> Pos =:= Ets_Item_Pos end, Wanted_Pid_Positions),
                           Fetch_Pids = lists:duplicate(length(Fetch_Positions), Datum_Pid),
                           {Fetch_Pids ++ Pids, Ets_Item_Pos+1, Wanted_Pid_Positions -- Fetch_Positions}
