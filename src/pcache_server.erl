@@ -203,6 +203,7 @@ handle_info({destroy, _Ref, _DatumPid, ok}, State) ->
 handle_info({'DOWN', _Ref, process, ReaperPid, _Reason}, 
     #cache{reaper_pid = ReaperPid, name = Name, cache_size = Size} = State) ->
   {NewReaperPid, _Mon} = pcache_reaper:start_link(Name, Size),
+  erlang:monitor(process, NewReaperPid),
   {noreply, State#cache{reaper_pid = NewReaperPid}};
 
 handle_info({'DOWN', _Ref, process, DatumPid, _Reason},
