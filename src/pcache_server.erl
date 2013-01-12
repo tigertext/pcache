@@ -6,7 +6,8 @@
 -export([init/1, handle_call/3, handle_cast/2,
          handle_info/2, terminate/2, code_change/3]).
 
--export([datum_loop/1]). % quiet unused function warning
+%% Spawned functions
+-export([datum_launch/7, datum_loop/1]).
 
 -record(cache, {name, datum_index, data_module, 
                 reaper_pid, data_accessor, cache_size,
@@ -51,70 +52,43 @@ init([Name, Mod, Fun, CacheSize, CacheTime, CachePolicy]) ->
   {ok, State}.
 
 locate(DatumKey, #cache{datum_index = DatumIndex, data_module = DataModule,
-                  default_ttl = DefaultTTL, cache_policy = Policy,
-                  data_accessor = DataAccessor} = _State) ->
-  Key = key(DatumKey),
-  case ets:lookup(DatumIndex, Key) of 
-    [{Key, Pid, _}] -> {found, Pid};
-    []           -> Pid = launch_datum(DatumKey, DatumIndex, DataModule,
-                                       DataAccessor, DefaultTTL, Policy),
-                    {launched, Pid};
-    Other        -> {failed, Other}
+                  default_ttl = DefaultTTL, cache_policy = Policy, data_accessor = DataAccessor}) ->
+  UseKey = key(DatumKey),
+  case ets:lookup(DatumIndex, UseKey) of 
+    [{UseKey, Pid, _Size}] when is_pid(Pid) -> Pid;
+    [] -> launch_datum(DatumKey, UseKey, DatumIndex, DataModule, DataAccessor, DefaultTTL, Policy)
   end.
 
-locate_memoize(DatumKey, DatumIndex, DataModule,
-               DataAccessor, DefaultTTL, Policy) ->
-  Key = key(DataModule, DataAccessor, DatumKey),
-  case ets:lookup(DatumIndex, Key) of 
-    [{Key, Pid, _}] -> {found, Pid};
-    []           -> Pid = launch_memoize_datum(DatumKey,
-                            DatumIndex, DataModule,
-                            DataAccessor, DefaultTTL, Policy),
-                    {launched, Pid};
-    Other        -> {failed, Other}
+locate_memoize(DatumKey, DatumIndex, DataModule, DataAccessor, DefaultTTL, Policy) ->
+  UseKey = key(DataModule, DataAccessor, DatumKey),
+  case ets:lookup(DatumIndex, UseKey) of 
+    [{UseKey, Pid, _Size}] when is_pid(Pid) -> Pid;
+    [] -> launch_memoize_datum(DatumKey, UseKey, DatumIndex, DataModule, DataAccessor, DefaultTTL, Policy)
   end.
 
 handle_call({location, DatumKey}, _From, State) -> 
-  Status = locate(DatumKey, State),
-  {reply, Status, State};
+  {reply, locate(DatumKey, State), State};
 
-handle_call({generic_get, M, F, Key}, _From, #cache{datum_index = DatumIndex,
-    data_module = _DataModule,
-    default_ttl = DefaultTTL,
-    cache_policy = Policy,
-    data_accessor = _DataAccessor} = State) ->
-%    io:format("Requesting: ~p:~p(~p)~n", [M, F, Key]),
-  Reply = 
-  case locate_memoize(Key, DatumIndex, M, F, DefaultTTL, Policy) of
-    {failed, Other} -> {failed, Other};
-      {_, DatumPid} -> case get_data(DatumPid) of
-                         {ok, Data} -> Data;
-                         {no_data, timeout} -> no_data
-                       end
-  end,
-  {reply, Reply, State};
+handle_call({generic_get, M, F, Key}, From,
+            #cache{datum_index = DatumIndex, default_ttl = DefaultTTL, cache_policy = Policy} = State) ->
+    %% io:format("Requesting: ~p:~p(~p)~n", [M, F, Key]),
+    DatumPid = locate_memoize(Key, DatumIndex, M, F, DefaultTTL, Policy),
+    DatumPid ! {get, From},
+    {noreply, State};
 
-handle_call({get, Key}, _From, #cache{datum_index = DatumIndex, cache_used = Used} = State) ->
-%    io:format("Requesting: (~p)~n", [Key]),
-  {Reply, New_Size} = 
-  case locate(Key, State) of
-    {failed, Other} -> {{failed, Other}, State};
-    {Found_Or_Launch, DatumPid} -> 
-      Used_New = case Found_Or_Launch of
-        launched -> case ets:match_object(DatumIndex, {'_', DatumPid, '_'}) of
-                      [{_, _, Size}] -> Used + Size; 
-                      _ -> Used
-                    end;
-        _ -> Used
-      end,
-      case get_data(DatumPid) of
-        {ok, Data} -> {Data, Used_New};
-        {no_data, timeout} -> {no_data, Used_New}
-      end
-  end,
-  {reply, Reply, State#cache{cache_used = New_Size}};
+    %% case get_data(DatumPid) of
+    %%     {ok,      Data    } -> {reply, Data, State};
+    %%     {no_data, timeout } -> spawn(?MODULE, delayed_reply, [From, DatumPid]),
+    %%                            {noreply, State}
+    %% end;
 
-handle_call(total_size, _From, #cache{datum_index = _DatumIndex, cache_used = Used} = State) ->
+handle_call({get, Key}, From, #cache{} = State) ->
+    %% io:format("Requesting: (~p)~n", [Key]),
+    DatumPid = locate(Key, State),
+    DatumPid ! {get, From},
+    {noreply, State};
+
+handle_call(total_size, _From, #cache{cache_used = Used} = State) ->
   {reply, Used, State};
 
 handle_call(stats, _From, #cache{datum_index = DatumIndex} = State) ->
@@ -126,26 +100,27 @@ handle_call(stats, _From, #cache{datum_index = DatumIndex} = State) ->
   {reply, Stats, State};
 
 handle_call(empty, _From, #cache{datum_index = DatumIndex} = State) ->
-  AllProcs = ets:tab2list(DatumIndex),
-  Pids = [Pid || {_DatumId, Pid} <- AllProcs],
-  Ref = make_ref(),
-  [X ! {destroy, Ref, self()} || X <- Pids],
-  {reply, ok, State};
+    %% We don't wait synchronously, so the make_ref() is just for a consistent interface message.
+    Ref = make_ref(),
+    Num_Destroyed = ets:foldl(fun({_DatumKey, DatumPid, _Size}, Num) ->
+                                      DatumPid ! {destroy, Ref, self()}, Num+1
+                              end, 0, DatumIndex),
+  {reply, Num_Destroyed, State};
 
 handle_call(reap_oldest, _From, #cache{datum_index = DatumIndex} = State) ->
-  GetOldest = fun({_Key, Pid, _Size}, {APid, Acc}) ->
+  GetOldest = fun({_UseKey, DatumPid, _Size}, {APid, Acc}) ->
                 Ref = make_ref(),
-                Pid ! {last_active, Ref, self()},
+                DatumPid ! {last_active, Ref, self()},
                 receive
-                  {last_active, Ref, Pid, LastActive} ->
+                  {last_active, Ref, DatumPid, LastActive} ->
                     if
                       Acc =< LastActive -> {APid, Acc};
-                      true -> {Pid, LastActive}
+                      true -> {DatumPid, LastActive}
                     end
                  after 200 -> {APid, Acc}
                  end
                end,
-  {OldPid, _LActive} = ets:foldr(GetOldest, {false, {9999,0,0}}, DatumIndex),
+  {OldPid, _LActive} = ets:foldl(GetOldest, {false, {9999,0,0}}, DatumIndex),
   case OldPid of
     false -> no_datum;
     _ -> Ref = make_ref(),
@@ -179,25 +154,22 @@ handle_call({rand, Type, Count}, _From,
 handle_call(Arbitrary, _From, State) ->
   {reply, {arbitrary, Arbitrary}, State}.
 
-handle_cast({dirty, Id, NewData}, #cache{datum_index = DatumIndex} = State) ->
-  case ets:lookup(DatumIndex, Id) of
-    [{Id, Pid, _}] -> Ref = make_ref(),
-                      Pid ! {new_data, Ref, self(), NewData},
-                   receive 
-                     {new_data, Ref, Pid, _OldData} -> ok
-                   after 
-                     100 -> fail
-                   end;
-             [] -> ok
-  end,
-  {noreply, State};
+handle_cast({dirty, DatumKey, NewData}, #cache{datum_index = DatumIndex} = State) ->
+    UseKey = key(DatumKey),
+    case ets:lookup(DatumIndex, UseKey) of
+        [{UseKey, DatumPid, _Size}] -> new_data(DatumPid, NewData);
+        [] -> noop
+    end,
+    %% TODO: What about cache_size?
+    {noreply, State};
 
-handle_cast({dirty, Id}, #cache{datum_index = DatumIndex, cache_used=Used} = State) ->
-  New_Size = case ets:lookup(DatumIndex, Id) of
-    [{Id, Pid, Size}] -> Ref = make_ref(),
-                         Pid ! {destroy, Ref, self()},
+handle_cast({dirty, DatumKey}, #cache{datum_index = DatumIndex, cache_used=Used} = State) ->
+    UseKey = key(DatumKey),
+    New_Size = case ets:lookup(DatumIndex, UseKey) of
+    [{UseKey, DatumPid, Size}] -> Ref = make_ref(),
+                         DatumPid ! {destroy, Ref, self()},
                    receive 
-                     {destroy, Ref, Pid, ok} -> ets:delete(DatumIndex, Id),
+                     {destroy, Ref, DatumPid, ok} -> ets:delete(DatumIndex, UseKey),
                                                 Used - Size
                    after 
                      100 -> Used 
@@ -206,25 +178,32 @@ handle_cast({dirty, Id}, #cache{datum_index = DatumIndex, cache_used=Used} = Sta
   end,
   {noreply, State#cache{cache_used = New_Size}};
 
-handle_cast({generic_dirty, M, F, A}, 
+handle_cast({generic_dirty, M, F, A},
     #cache{datum_index = DatumIndex} = State) ->
-  case ets:lookup(DatumIndex, key(M, F, A)) of
-    
-    [{{M, F, A}, Pid, _}] -> Ref = make_ref(),
-                             Pid ! {destroy, Ref, self()},
+    UseKey = key(M, F, A),
+    case ets:lookup(DatumIndex, UseKey) of
+        [{UseKey, DatumPid, _}] -> Ref = make_ref(),
+                             DatumPid ! {destroy, Ref, self()},
                    receive 
-                     {destroy, Ref, Pid, ok} -> ok
+                     {destroy, Ref, DatumPid, ok} -> ok
                    after 
                      100 -> fail
                    end;
     [] -> ok
   end,
+    %% TODO: What about cache_size?
   {noreply, State}.
 
 terminate(_Reason, _State) ->
     ok.
 
-handle_info({destroy,_DatumPid, ok}, State) ->
+%% New datum is inserted at 0 size initially, then updated with real size by a message.
+handle_info({new_datum_size, {UseKey, DatumPid, Size}},
+            #cache{datum_index = DatumIndex, cache_used = Used} = State) ->
+  ets:insert(DatumIndex, {UseKey, DatumPid, Size}),
+  {noreply, State#cache{cache_used = Used + Size}};
+
+handle_info({destroy, _Ref, _DatumPid, ok}, State) ->
   {noreply, State};
 
 handle_info({'DOWN', _Ref, process, ReaperPid, _Reason}, 
@@ -232,12 +211,18 @@ handle_info({'DOWN', _Ref, process, ReaperPid, _Reason},
   {NewReaperPid, _Mon} = pcache_reaper:start_link(Name, Size),
   {noreply, State#cache{reaper_pid = NewReaperPid}};
 
-handle_info({'DOWN', _Ref, process, Pid, _Reason}, 
+handle_info({'DOWN', _Ref, process, DatumPid, _Reason},
     #cache{datum_index = DatumIndex, cache_used=Used} = State) ->
-  New_State = case ets:match_object(DatumIndex, {'_', Pid, '_'}) of
-    [{Key, _, Size}] -> ets:delete(DatumIndex, Key),
-                        State#cache{cache_used = Used - Size};
-    _ -> State 
+
+  %% Remove the _one_ pending 'new_datum_size' message, if it exists...
+  receive {new_datum_size, {_UseKey, DatumPid, _Size}} -> noop
+  after 0 -> none
+  end,
+
+  New_State = case ets:match_object(DatumIndex, {'_', DatumPid, '_'}) of
+                  [{Key, _, Size}] -> ets:delete(DatumIndex, Key),
+                                      State#cache{cache_used = Used - Size};
+                  [] -> State 
   end,
   {noreply, New_State};
 
@@ -252,51 +237,69 @@ code_change(_OldVsn, State, _Extra) ->
 key(Key) -> Key.
 key(M, F, A) -> {M, F, A}.
 
+
 %% ===================================================================
 %% Private
 %% ===================================================================
-get_data(DatumPid) ->
+
+new_data(DatumPid, NewData) -> new_data(DatumPid, NewData, 100).
+new_data(DatumPid, NewData, Timeout) ->
   Ref = make_ref(),
-  DatumPid ! {get, Ref, self()},
-  receive
-    {get, Ref, DatumPid, Data} -> {ok, Data}
-  after
-    100  -> {no_data, timeout}
+  DatumPid ! {new_data, Ref, self(), NewData},
+  receive {new_data, Ref, DatumPid, _OldData} -> ok
+  after Timeout -> fail
   end.
 
-get_key(DatumPid) ->
+get_data(DatumPid) -> get_data(DatumPid, 100).
+get_data(DatumPid, Timeout) ->
+  Ref = make_ref(),
+  DatumPid ! {get, Ref, self()},
+  receive {get, Ref, DatumPid, Data} -> {ok, Data}
+  after Timeout -> {no_data, timeout}
+  end.
+
+get_key(DatumPid) -> get_key(DatumPid, 100).
+get_key(DatumPid, Timeout) ->
   Ref = make_ref(),
   DatumPid ! {getkey, Ref, self()},
-  receive
-    {getkey, Ref, DatumPid, Key} -> {ok, Key}
-  after
-    100 -> {no_data, timeout}
+  receive {getkey, Ref, DatumPid, Key} -> {ok, Key}
+  after Timeout -> {no_data, timeout}
   end.
 
 -record(datum, {key, mgr, data, started,
                 last_active, ttl, type = mru, remaining_ttl}).
 
-create_datum(Key, Data, TTL, Type) ->
-  #datum{key = Key, mgr = self(), data = Data, started = now(),
+create_datum(Cache_Server, Key, Data, TTL, Type) ->
+  #datum{key = Key, mgr = Cache_Server, data = Data, started = now(),
          ttl = TTL, remaining_ttl = TTL, type = Type}.
 
-launch_datum(Key, EtsIndex, Module, Accessor, TTL, CachePolicy) ->
+make_new_datum(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy) ->
   CacheData = Module:Accessor(Key),
-  UseKey = key(Key),
-  Datum = create_datum(UseKey, CacheData, TTL, CachePolicy),
-  {Pid, _Monitor} = erlang:spawn_monitor(?MODULE, datum_loop, [Datum]),
-  {_, Size} = process_info(Pid, memory),
-  ets:insert(EtsIndex, {UseKey, Pid, Size}),
-  Pid.
+  create_datum(Cache_Server, UseKey, CacheData, TTL, CachePolicy).
 
-launch_memoize_datum(Key, EtsIndex, Module, Accessor, TTL, CachePolicy) ->
-  CacheData = Module:Accessor(Key),
-  UseKey = key(Module, Accessor, Key),
-  Datum = create_datum(UseKey, CacheData, TTL, CachePolicy),
-  {Pid, _Monitor} = erlang:spawn_monitor(?MODULE, datum_loop, [Datum]),
-  {_, Size} = process_info(Pid, memory),
-  ets:insert(EtsIndex, {UseKey, Pid, Size}),
-  Pid.
+launch_datum(DatumKey, UseKey, EtsIndex, Module, Accessor, TTL, CachePolicy) ->
+  Datum_Args = [self(), DatumKey, UseKey, Module, Accessor, TTL, CachePolicy],
+  {Datum_Pid, _Monitor} = erlang:spawn_monitor(?MODULE, datum_launch, Datum_Args),
+  ets:insert(EtsIndex, {UseKey, Datum_Pid, 0}),
+  Datum_Pid.
+
+launch_memoize_datum(DatumKey, UseKey, EtsIndex, Module, Accessor, TTL, CachePolicy) ->
+  Datum_Args = [self(), DatumKey, UseKey, Module, Accessor, TTL, CachePolicy],
+  {Datum_Pid, _Monitor} = erlang:spawn_monitor(?MODULE, datum_launch, Datum_Args),
+  ets:insert(EtsIndex, {UseKey, Datum_Pid, 0}),
+  Datum_Pid.
+
+
+%%% =======================================================================
+%%% Datum launch and message response functions
+%%% =======================================================================
+
+datum_launch(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy) ->
+    Datum = make_new_datum(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy),
+    Datum_Pid = self(),
+    {_, Size} = process_info(Datum_Pid, memory),
+    Cache_Server ! {new_datum_size, {UseKey, Datum_Pid, Size}},
+    datum_loop(Datum).
 
 update_ttl(#datum{started = Started, ttl = TTL,
                   type = actual_time} = Datum) ->
@@ -315,7 +318,7 @@ update_ttl(Datum) ->
 
 update_data(Datum, NewData) ->
   Datum#datum{data = NewData}.
-
+    
 continue(Datum) ->
   ?MODULE:datum_loop(update_ttl(Datum)).
 
@@ -333,12 +336,12 @@ datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
       Mgr ! {InvalidMgrRequest, Ref, self(), invalid_creator_request},
       continue(State);
 
-    {get, Ref, From} ->
-      From ! {get, Ref, self(), Data},
+    {get, Gen_Server_From} ->
+      gen_server:reply(Gen_Server_From, Data),
       continue(State);
 
-    {getkey, Ref, From} ->
-      From ! {getkey, Ref, self(), Key},
+    {getkey, Gen_Server_From} ->
+      gen_server:reply(Gen_Server_From, Key),
       continue(State);
 
     {memsize, Ref, From} ->
