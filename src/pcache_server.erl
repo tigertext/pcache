@@ -214,12 +214,12 @@ handle_info({'DOWN', _Ref, process, DatumPid, _Reason},
   after 0 -> none
   end,
 
-  New_State = case ets:match_object(DatumIndex, {'_', DatumPid, '_'}) of
-                  [{Key, _, Size}] -> ets:delete(DatumIndex, Key),
-                                      State#cache{cache_used = Used - Size};
-                  [] -> State 
-  end,
-  {noreply, New_State};
+  %% New_State = case ets:match_object(DatumIndex, {'_', DatumPid, '_'}) of
+  %%                 [{Key, _, Size}] -> ets:delete(DatumIndex, Key),
+  %%                                     State#cache{cache_used = Used - Size};
+  %%                 [] -> State 
+  %% end,
+  {noreply, State};
 
 handle_info(_Info, State) ->
   %% io:format("Other info of: ~p~n", [Info]),
