@@ -76,12 +76,6 @@ handle_call({generic_get, M, F, Key}, From,
     DatumPid ! {get, From},
     {noreply, State};
 
-    %% case get_data(DatumPid) of
-    %%     {ok,      Data    } -> {reply, Data, State};
-    %%     {no_data, timeout } -> spawn(?MODULE, delayed_reply, [From, DatumPid]),
-    %%                            {noreply, State}
-    %% end;
-
 handle_call({get, Key}, From, #cache{} = State) ->
     %% io:format("Requesting: (~p)~n", [Key]),
     DatumPid = locate(Key, State),
@@ -320,10 +314,10 @@ update_data(Datum, NewData) ->
   Datum#datum{data = NewData}.
     
 continue(Datum) ->
-  ?MODULE:datum_loop(update_ttl(Datum)).
+  datum_loop(update_ttl(Datum)).
 
 continue_noreset(Datum) ->
-  ?MODULE:datum_loop(Datum).
+  datum_loop(Datum).
 
 datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
             data = Data, remaining_ttl = TTL} = State) ->
