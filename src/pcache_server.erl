@@ -214,12 +214,16 @@ handle_info({'DOWN', _Ref, process, DatumPid, _Reason},
   after 0 -> none
   end,
 
-  %% New_State = case ets:match_object(DatumIndex, {'_', DatumPid, '_'}) of
-  %%                 [{Key, _, Size}] -> ets:delete(DatumIndex, Key),
-  %%                                     State#cache{cache_used = Used - Size};
-  %%                 [] -> State 
-  %% end,
-  {noreply, State};
+  %% There can only be 1 entry in an ets 'set' table, so don't scan full table.
+  New_State =
+        case ets:match_object(DatumIndex, {'_', DatumPid, '_'}, 1) of
+            '$end_of_table' -> State;
+            {[], _Cont_Fn}  -> State; 
+            {[{UseKey, DatumPid, Size}], _Cont_Fn} ->
+                ets:delete(DatumIndex, UseKey),
+                State#cache{cache_used = Used - Size}
+        end,
+  {noreply, New_State};
 
 handle_info(_Info, State) ->
   %% io:format("Other info of: ~p~n", [Info]),
