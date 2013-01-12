@@ -328,6 +328,7 @@ launch_memoize_datum(DatumKey, UseKey, EtsIndex, Module, Accessor, TTL, CachePol
 datum_launch(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy) ->
     Datum = make_new_datum(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy),
     Datum_Pid = self(),
+    garbage_collect(),
     {memory, Size} = process_info(Datum_Pid, memory),
     Cache_Server ! {new_datum_size, {UseKey, Datum_Pid, Size}},
     datum_loop(Datum).
