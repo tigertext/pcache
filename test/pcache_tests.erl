@@ -1,7 +1,10 @@
 -module(pcache_tests).
 -include_lib("eunit/include/eunit.hrl").
 
--export([tester/1, memoize_tester/1]).
+-export([tester/1, memoize_tester/1, slow_tester/1]).
+
+%% Spawned functions
+-export([notify/3]).
 
 -define(E(A, B), ?assertEqual(A, B)).
 -define(_E(A, B), ?_assertEqual(A, B)).
@@ -10,7 +13,7 @@ pcache_setup() ->
   % start cache server tc (test cache)
   % 6 MB cache
   % 5 minute TTL per entry (300 seconds)
-  {ok, Pid} = pcache_server:start_link(tc, pcache_tests, tester, 6, 300000),
+  {ok, Pid} = pcache_server:start_link(tc, ?MODULE, tester, 6, 300000),
   Pid.
 
 pcache_cleanup(Cache) ->
@@ -36,14 +39,19 @@ pcache_test_() ->
         ?_E(erlang:crc32("bob2"),
             pcache:memoize(tc, ?MODULE, memoize_tester, "bob2")),
         ?_E(ok, pcache:dirty_memoize(tc, ?MODULE, memoize_tester, "bob2")),
-        ?_E(0, pcache:total_size(tc)),
+        ?_E(true, pcache:total_size(tc) > 0),
+        %% ?_E(2768, pcache:total_size(tc)),
         ?_E([{cache_name, tc}, {datum_count, 1}], pcache:stats(tc)),
-        ?_E(ok, pcache:empty(tc)),
+        ?_E(1, pcache:empty(tc)),
         ?_E(0, pcache:total_size(tc))
       ]
     end
   }.
   
+
+%%% =======================================================================
+%%% Test the speed of gets when the gen_server message queue is full
+%%% =======================================================================
 pcache_queue_test_() ->
     {setup, fun pcache_setup/0, fun pcache_cleanup/1,
      {with, [fun check_msg_queue_speed/1]}
@@ -87,4 +95,58 @@ get_results(Count) ->
     receive {datum, _Result} -> get_results(Count-1)
     after 3000 -> timeout
     end.                         
+
+
+%%% =======================================================================
+%%% Test that slow new value M:F(A) doesn't stall get requests
+%%% =======================================================================
+pcache_slow_setup() ->
+  % start cache server tc (test cache)
+  % 6 MB cache
+  % 5 minute TTL per entry (300 seconds)
+  {ok, Pid} = pcache_server:start_link(tc, ?MODULE, slow_tester, 6, 300000),
+  Pid.
+
+-define(SLOW, 700).
+
+slow_tester(Key) when is_binary(Key) orelse is_list(Key) ->
+    timer:sleep(?SLOW),
+    erlang:md5(Key).
                                      
+pcache_spawn_test_() ->
+    {setup, fun pcache_slow_setup/0, fun pcache_cleanup/1,
+     {with, [fun check_spawn_speed/1]}
+     }.
+
+notify(Caller, Cache, Existing_Key) ->
+    {Micros, Result} = timer:tc(pcache, get, [Cache, Existing_Key]),
+    Caller ! {datum, Existing_Key, Micros, Result}.
+    
+fetch_timing(Cache, Existing_Key, New_Key) ->
+    Caller = self(),
+    %% Attempt to plug up the server generating a new key...
+    spawn(pcache, get, [Cache, New_Key]),
+    %% While waiting for existing key fetches.
+    [spawn(?MODULE, notify, [Caller, Cache, Existing_Key]) || _N <- lists:seq(1,5)],
+
+    get_key_results(5, []).
+
+get_key_results(0,     Results) -> Results;
+get_key_results(Count, Results) ->
+    receive Datum -> get_key_results(Count-1, [Datum | Results])
+    after (?SLOW*4) -> timeout
+    end.                         
+    
+check_spawn_speed(Cache) ->
+    Existing_Result = erlang:md5("existing_key"),
+    {Micros_Existing, Get_Existing_New} = timer:tc(fun() -> pcache:get(Cache, "existing_key") end),
+    ?assertMatch(Existing_Result, Get_Existing_New),
+    ?assert((?SLOW * 1000) < Micros_Existing),
+
+    Results = fetch_timing(Cache, "existing_key", "created_key"),
+    ?assertMatch(5, length(Results)),
+    Slow_Fetches = [[{latency, Micros}, {key, Key}, {result, Result}]
+                    || {datum, Key, Micros, Result} <- Results, Micros > 300],
+    ?assertMatch([], Slow_Fetches),
+    ?assertMatch([], [R || {datum, _Key, _Micros, R} <- Results, R =/= Existing_Result]).
+                            
