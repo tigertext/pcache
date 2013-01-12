@@ -37,7 +37,7 @@ check_get_and_dirty(_Cache) ->
     Bob2_Value = erlang:md5("bob2"),
     ?assertMatch(Bob_Value,  pcache:get(tc, "bob")),
     ?assertMatch(Bob2_Value, pcache:get(tc, "bob2")),
-    timer:sleep(100),
+    timer:sleep(10),
     ?assertMatch([{cache_name, tc}, {datum_count, 2}], pcache:stats(tc)),
 
     ?assertMatch(ok, pcache:dirty(tc, "bob2")),
@@ -45,7 +45,7 @@ check_get_and_dirty(_Cache) ->
     Bob2_Crc = erlang:crc32("bob2"),
     ?assertMatch(Bob2_Crc, pcache:memoize(tc, ?MODULE, memoize_tester, "bob2")),
     ?assertMatch(ok, pcache:dirty_memoize(tc, ?MODULE, memoize_tester, "bob2")),
-    timer:sleep(100),
+    timer:sleep(10),
 
     ?assertMatch([{cache_name, tc}, {datum_count, 1}], pcache:stats(tc)),
     ?assertMatch(1, pcache:empty(tc)).
@@ -53,17 +53,29 @@ check_get_and_dirty(_Cache) ->
 check_cache_size(Cache) ->
     ?assertMatch(0, pcache:total_size(Cache)),
     pcache:get(Cache, "bob"),
-    timer:sleep(100),
+    timer:sleep(10),
     Size1 = pcache:total_size(Cache),
     ?assert(Size1 > 0),
     pcache:get(tc, "bob2"),
-    timer:sleep(100),
+    timer:sleep(10),
     Size2 = pcache:total_size(Cache),
     ?assert(Size2 > Size1),
     pcache:dirty(Cache, "bob2"),
-    timer:sleep(100),
+    timer:sleep(10),
     ?assertMatch(Size1, pcache:total_size(Cache)),
-    ?assertMatch(1, pcache:empty(Cache)),
+
+    Bob2 = pcache:get(Cache, "bob2"),
+    timer:sleep(10),
+    ?assertMatch(Size2, pcache:total_size(Cache)),
+    ?assertMatch(Bob2, erlang:md5("bob2")),
+    Long_Value = lists:duplicate(3,"supercalifragilisticexpialidocious"),
+    pcache:dirty(Cache, "bob2", Long_Value),
+    timer:sleep(10),
+    ?assertMatch(Long_Value, pcache:get(Cache, "bob2")),
+    Size3 = pcache:total_size(Cache),
+    ?assert(Size3 > Size2),
+
+    ?assertMatch(2, pcache:empty(Cache)),
     ?assertMatch(0, pcache:total_size(Cache)).
 
   

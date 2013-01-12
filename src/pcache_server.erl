@@ -178,45 +178,40 @@ handle_call(Catch_All, _From, State) ->
 %%% handle_cast messages
 %%%----------------------------------------------------------------------
 
-handle_cast({dirty, DatumKey, NewData}, #cache{datum_index = DatumIndex} = State) ->
+handle_cast({dirty, DatumKey, NewData},
+            #cache{datum_index = DatumIndex, cache_used = Used} = State) ->
     UseKey = key(DatumKey),
     case ets:lookup(DatumIndex, UseKey) of
-        [{UseKey, DatumPid, _Size}] -> new_data(DatumPid, NewData);
-        [] -> noop
-    end,
-    %% TODO: What about cache_size?
-    {noreply, State};
+        [] -> {noreply, State};
+        [{UseKey, DatumPid, Size}] ->
+            DatumPid ! {new_data, make_ref(), self(), NewData},
+            %% Cache size is incremented by handle_info new_datum_size message
+            {noreply, State#cache{cache_used = Used - Size}}
+    end;
 
-handle_cast({dirty, DatumKey}, #cache{datum_index = DatumIndex, cache_used=Used} = State) ->
+handle_cast({dirty, DatumKey}, #cache{datum_index = DatumIndex} = State) ->
     UseKey = key(DatumKey),
-    New_Size = case ets:lookup(DatumIndex, UseKey) of
-    [{UseKey, DatumPid, Size}] -> Ref = make_ref(),
-                         DatumPid ! {destroy, Ref, self()},
-                   receive 
-                     {destroy, Ref, DatumPid, ok} -> ets:delete(DatumIndex, UseKey),
-                                                Used - Size
-                   after 
-                     100 -> Used 
-                   end;
-    [] -> Used 
-  end,
-  {noreply, State#cache{cache_used = New_Size}};
+    case ets:lookup(DatumIndex, UseKey) of
+        [] -> noop;
+        [{UseKey, DatumPid, _Size}] ->
+            Ref = make_ref(),
+            DatumPid ! {destroy, Ref, self()}
+    end,
+    %% Cache size is updated by handle_info 'DOWN' message
+    {noreply, State};
 
 handle_cast({generic_dirty, M, F, A},
     #cache{datum_index = DatumIndex} = State) ->
     UseKey = key(M, F, A),
     case ets:lookup(DatumIndex, UseKey) of
-        [{UseKey, DatumPid, _}] -> Ref = make_ref(),
-                             DatumPid ! {destroy, Ref, self()},
-                   receive 
-                     {destroy, Ref, DatumPid, ok} -> ok
-                   after 
-                     100 -> fail
-                   end;
-    [] -> ok
-  end,
-    %% TODO: What about cache_size?
-  {noreply, State}.
+        [] -> noop;
+        [{UseKey, DatumPid, _}] ->
+            Ref = make_ref(),
+            DatumPid ! {destroy, Ref, self()}
+    end,
+    %% Cache size is updated by handle_info 'DOWN' message
+    {noreply, State}.
+
 
 %%%----------------------------------------------------------------------
 %%% handle_info messages
@@ -238,7 +233,7 @@ handle_info({'DOWN', _Ref, process, ReaperPid, _Reason},
   {noreply, State#cache{reaper_pid = NewReaperPid}};
 
 handle_info({'DOWN', _Ref, process, DatumPid, _Reason},
-    #cache{datum_index = DatumIndex, cache_used=Used} = State) ->
+    #cache{datum_index = DatumIndex, cache_used = Used} = State) ->
 
   %% Remove the _one_ pending 'new_datum_size' message, if it exists...
   receive {new_datum_size, {_UseKey, DatumPid, _Size}} -> noop
@@ -282,14 +277,6 @@ filter_oldest( Ref, N,  Oldest_Active, Oldest_Pid) ->
             end
     after 50 -> Oldest_Pid
     end.
-
-new_data(DatumPid, NewData) -> new_data(DatumPid, NewData, 100).
-new_data(DatumPid, NewData, Timeout) ->
-  Ref = make_ref(),
-  DatumPid ! {new_data, Ref, self(), NewData},
-  receive {new_data, Ref, DatumPid, _OldData} -> ok
-  after Timeout -> fail
-  end.
 
 get_data(DatumPid) -> get_data(DatumPid, 100).
 get_data(DatumPid, Timeout) ->
@@ -338,17 +325,17 @@ launch_memoize_datum(DatumKey, UseKey, EtsIndex, Module, Accessor, TTL, CachePol
   ets:insert(EtsIndex, {UseKey, Datum_Pid, 0}),
   Datum_Pid.
 
-
-%%% =======================================================================
-%%% Datum launch and message response functions
-%%% =======================================================================
-
 datum_launch(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy) ->
     Datum = make_new_datum(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy),
     Datum_Pid = self(),
-    {_, Size} = process_info(Datum_Pid, memory),
+    {memory, Size} = process_info(Datum_Pid, memory),
     Cache_Server ! {new_datum_size, {UseKey, Datum_Pid, Size}},
     datum_loop(Datum).
+
+
+%%% =======================================================================
+%%% Datum pid internal state management and main receive loop
+%%% =======================================================================
 
 update_ttl(#datum{started = Started, ttl = TTL, type = actual_time} = Datum) ->
 
@@ -364,25 +351,34 @@ update_ttl(#datum{started = Started, ttl = TTL, type = actual_time} = Datum) ->
                     end,
     Datum#datum{last_active = Now, remaining_ttl = TTL_Remaining};
 
-update_ttl(Datum) ->
+update_ttl(#datum{} = Datum) ->
     Datum#datum{last_active = calendar:time_to_seconds(now())}.
 
-update_data(Datum, NewData) ->
+update_data(#datum{} = Datum, NewData) ->
   Datum#datum{data = NewData}.
     
-continue(Datum) ->
+continue(#datum{} = Datum) ->
   datum_loop(update_ttl(Datum)).
 
-continue_noreset(Datum) ->
+continue_noreset(#datum{} = Datum) ->
   datum_loop(Datum).
 
+%% Give process a chance to discard old #datum{} before notifying.
+datum_size_notify(Mgr, #datum{key = Key} = Datum) ->
+    garbage_collect(),
+    {memory, Size} = process_info(self(), memory),
+    Mgr ! {new_datum_size, {Key, self(), Size}},
+    datum_loop(Datum).
+
+%% Main loop for datum replies and updates.    
 datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
             data = Data, remaining_ttl = TTL} = State) ->
   receive
-    {new_data, Ref, Mgr, Replacement} ->
-      Mgr ! {new_data, Ref, self(), Data},
-      continue(update_data(Replacement, State));
+    {new_data, _Ref, Mgr, Replacement} ->
+      New_Datum = update_data(State, Replacement),
+      datum_size_notify(Mgr, update_ttl(New_Datum));
 
+    %% Presumably bad code elsewhere, but intent is for datum to be activated...
     {InvalidMgrRequest, Ref, Mgr, _Other} ->
       Mgr ! {InvalidMgrRequest, Ref, self(), invalid_creator_request},
       continue(State);
@@ -412,6 +408,7 @@ datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
       % io:format("destroying ~p with last access of ~p~n", [self(), LastActive]),
       exit(self(), destroy);
 
+    %% Presumably bad code elsewhere, but intent is for datum to be activated...
     {InvalidRequest, Ref, From} ->
       From ! {InvalidRequest, Ref, self(), invalid_request},
       continue(State);
