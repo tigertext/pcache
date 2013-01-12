@@ -9,9 +9,19 @@
 %% Spawned functions
 -export([datum_launch/7, datum_loop/1]).
 
--record(cache, {name, datum_index, data_module, 
-                reaper_pid, data_accessor, cache_size,
-                cache_policy, default_ttl, cache_used = 0}).
+-type cache_policy() :: mru | actual_time.
+
+-record(cache, {
+          name             :: atom(),
+          datum_index      :: ets:tab(),
+          data_module      :: module(), 
+          reaper_pid       :: pid(),
+          data_accessor    :: atom(),
+          cache_size       :: pos_integer(),
+          cache_policy     :: cache_policy(),
+          default_ttl      :: pos_integer(),
+          cache_used = 0   :: non_neg_integer()
+         }).
 
 % make 8 MB cache
 start_link(Name, Mod, Fun) ->
@@ -25,9 +35,11 @@ start_link(Name, Mod, Fun, CacheSize) ->
 start_link(Name, Mod, Fun, CacheSize, CacheTime) ->
   start_link(Name, Mod, Fun, CacheSize, CacheTime, mru).
 
-start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy) ->
-  gen_server:start_link({local, Name}, 
-    ?MODULE, [Name, Mod, Fun, CacheSize, CacheTime, CachePolicy], []).
+start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy)
+  when CachePolicy =:= mru; CachePolicy =:= actual_time ->
+    Args = [Name, Mod, Fun, CacheSize, CacheTime, CachePolicy],
+    gen_server:start_link({local, Name}, ?MODULE, Args, []).
+
 
 %%%----------------------------------------------------------------------
 %%% Callback functions from gen_server
@@ -265,12 +277,20 @@ get_key(DatumPid, Timeout) ->
   after Timeout -> {no_data, timeout}
   end.
 
--record(datum, {key, mgr, data, started,
-                last_active, ttl, type = mru, remaining_ttl}).
+-record(datum, {
+          key            :: any(),
+          mgr            :: pid(),
+          data           :: any(),
+          started        :: pos_integer(),
+          last_active    :: pos_integer(),
+          ttl            :: pos_integer(),
+          type           :: cache_policy(),
+          remaining_ttl  :: non_neg_integer()
+         }).
 
 create_datum(Cache_Server, Key, Data, TTL, Type) ->
-  #datum{key = Key, mgr = Cache_Server, data = Data, started = now(),
-         ttl = TTL, remaining_ttl = TTL, type = Type}.
+  #datum{key = Key, mgr = Cache_Server, data = Data, ttl = TTL,
+         remaining_ttl = TTL, type = Type, started = calendar:time_to_seconds(now())}.
 
 make_new_datum(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy) ->
   CacheData = Module:Accessor(Key),
@@ -300,20 +320,22 @@ datum_launch(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy) ->
     Cache_Server ! {new_datum_size, {UseKey, Datum_Pid, Size}},
     datum_loop(Datum).
 
-update_ttl(#datum{started = Started, ttl = TTL,
-                  type = actual_time} = Datum) ->
-  % Get total time in seconds this datum has been running.  Convert to ms.
-  StartedNowDiff = (calendar:time_to_seconds(now()) - 
-                    calendar:time_to_seconds(Started)) * 1000,
-  % If we are less than the TTL, update with TTL-used (TTL in ms too)
-  % else, we ran out of time.  expire on next loop.
-  TTLRemaining = if
-                   StartedNowDiff < TTL -> TTL - StartedNowDiff;
-                                   true -> 0
-                 end,
-  Datum#datum{last_active = now(), remaining_ttl = TTLRemaining};
+update_ttl(#datum{started = Started, ttl = TTL, type = actual_time} = Datum) ->
+
+    %% Get total time in seconds this datum has been running.  Convert to ms.
+    Now = now(),
+    Started_Now_Diff = (calendar:time_to_seconds(Now) - Started) * 1000,
+
+    %% If we are less than the TTL, update with TTL-used (TTL in ms too)
+    %% else, we ran out of time.  expire on next loop.
+    TTL_Remaining = case TTL - Started_Now_Diff of
+                        Remainder when Remainder > 0 -> Remainder;
+                        _ -> 0
+                    end,
+    Datum#datum{last_active = Now, remaining_ttl = TTL_Remaining};
+
 update_ttl(Datum) ->
-  Datum#datum{last_active = now()}.
+    Datum#datum{last_active = now()}.
 
 update_data(Datum, NewData) ->
   Datum#datum{data = NewData}.
