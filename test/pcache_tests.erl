@@ -10,13 +10,12 @@
 -define(_E(A, B), ?_assertEqual(A, B)).
 
 pcache_setup() ->
-  % start cache server tc (test cache)
-  % 6 MB cache
-  % 5 minute TTL per entry (300 seconds)
+  %% start cache server tc (test cache), 6 MB cache, 5 minute TTL per entry (300 seconds)
   {ok, Pid} = pcache_server:start_link(tc, ?MODULE, tester, 6, 300000),
   Pid.
 
 pcache_cleanup(Cache) ->
+    pcache:empty(Cache),
     unregister(tc),
     exit(Cache, normal).
 
@@ -27,26 +26,46 @@ memoize_tester(Key) when is_binary(Key) orelse is_list(Key) ->
   erlang:crc32(Key).
 
 pcache_test_() ->
-  {setup,
-    fun pcache_setup/0,
-    fun pcache_cleanup/1,
-    fun(_C) ->
-      [
-        ?_E(erlang:md5("bob"),  pcache:get(tc, "bob")),
-        ?_E(erlang:md5("bob2"), pcache:get(tc, "bob2")),
-        ?_E(ok,   pcache:dirty(tc, "bob2")),
-        ?_E(ok,   pcache:dirty(tc, "bob2")),
-        ?_E(erlang:crc32("bob2"),
-            pcache:memoize(tc, ?MODULE, memoize_tester, "bob2")),
-        ?_E(ok, pcache:dirty_memoize(tc, ?MODULE, memoize_tester, "bob2")),
-        ?_E(true, pcache:total_size(tc) > 0),
-        %% ?_E(2768, pcache:total_size(tc)),
-        ?_E([{cache_name, tc}, {datum_count, 1}], pcache:stats(tc)),
-        ?_E(1, pcache:empty(tc)),
-        ?_E(0, pcache:total_size(tc))
-      ]
-    end
-  }.
+  {foreach, fun pcache_setup/0, fun pcache_cleanup/1,
+   [
+    {with, [fun check_get_and_dirty/1]},
+    {with, [fun check_cache_size/1]}
+   ]}.
+
+check_get_and_dirty(_Cache) ->
+    Bob_Value = erlang:md5("bob"),
+    Bob2_Value = erlang:md5("bob2"),
+    ?assertMatch(Bob_Value,  pcache:get(tc, "bob")),
+    ?assertMatch(Bob2_Value, pcache:get(tc, "bob2")),
+    timer:sleep(100),
+    ?assertMatch([{cache_name, tc}, {datum_count, 2}], pcache:stats(tc)),
+
+    ?assertMatch(ok, pcache:dirty(tc, "bob2")),
+    ?assertMatch(ok, pcache:dirty(tc, "bob2")),
+    Bob2_Crc = erlang:crc32("bob2"),
+    ?assertMatch(Bob2_Crc, pcache:memoize(tc, ?MODULE, memoize_tester, "bob2")),
+    ?assertMatch(ok, pcache:dirty_memoize(tc, ?MODULE, memoize_tester, "bob2")),
+    timer:sleep(100),
+
+    ?assertMatch([{cache_name, tc}, {datum_count, 1}], pcache:stats(tc)),
+    ?assertMatch(1, pcache:empty(tc)).
+
+check_cache_size(Cache) ->
+    ?assertMatch(0, pcache:total_size(Cache)),
+    pcache:get(Cache, "bob"),
+    timer:sleep(100),
+    Size1 = pcache:total_size(Cache),
+    ?assert(Size1 > 0),
+    pcache:get(tc, "bob2"),
+    timer:sleep(100),
+    Size2 = pcache:total_size(Cache),
+    ?assert(Size2 > Size1),
+    pcache:dirty(Cache, "bob2"),
+    timer:sleep(100),
+    ?assertMatch(Size1, pcache:total_size(Cache)),
+    ?assertMatch(1, pcache:empty(Cache)),
+    ?assertMatch(0, pcache:total_size(Cache)).
+
   
 
 %%% =======================================================================
@@ -80,6 +99,7 @@ check_msg_queue_speed(Cache) ->
     {Micros_3, ok} = timer:tc(fun() -> get_results(Msg_Count_3) end),
     Avg_Time_3 = Micros_3 / Msg_Count_3,
 
+    %% 70 microseconds on avg to fetch values when queue is full...
     Speeds = [[{msg_count, Msg_Count_1}, {avg_time, Avg_Time_1}, {fast_enough, 70 > Avg_Time_1}],
               [{msg_count, Msg_Count_2}, {avg_time, Avg_Time_2}, {fast_enough, 70 > Avg_Time_2}],
               [{msg_count, Msg_Count_3}, {avg_time, Avg_Time_3}, {fast_enough, 70 > Avg_Time_3}]],
@@ -101,9 +121,6 @@ get_results(Count) ->
 %%% Test that slow new value M:F(A) doesn't stall get requests
 %%% =======================================================================
 pcache_slow_setup() ->
-  % start cache server tc (test cache)
-  % 6 MB cache
-  % 5 minute TTL per entry (300 seconds)
   {ok, Pid} = pcache_server:start_link(tc, ?MODULE, slow_tester, 6, 300000),
   Pid.
 
@@ -143,10 +160,54 @@ check_spawn_speed(Cache) ->
     ?assertMatch(Existing_Result, Get_Existing_New),
     ?assert((?SLOW * 1000) < Micros_Existing),
 
+    %% 300 microseconds to fetch an existing value queued behind
+    %% a new value construction that takes 1000 microseconds
     Results = fetch_timing(Cache, "existing_key", "created_key"),
     ?assertMatch(5, length(Results)),
     Slow_Fetches = [[{latency, Micros}, {key, Key}, {result, Result}]
                     || {datum, Key, Micros, Result} <- Results, Micros > 300],
     ?assertMatch([], Slow_Fetches),
     ?assertMatch([], [R || {datum, _Key, _Micros, R} <- Results, R =/= Existing_Result]).
-                            
+
+
+%%% =======================================================================
+%%% Test that TTL and reaper culls the oldest values
+%%% =======================================================================
+pcache_fast_ttl_setup() ->
+  %% start cache server tc (test cache), 6 MB cache, 2 second TTL per entry (300 seconds)
+  {ok, Pid} = pcache_server:start_link(tc, ?MODULE, tester, 6, 2000),
+  Pid.
+
+pcache_ttl_test_() ->
+  {setup, fun pcache_fast_ttl_setup/0, fun pcache_cleanup/1,
+    {with, [fun check_ttl/1]}
+  }.
+
+check_ttl(Cache) ->
+    pcache:get(Cache, "jim1"),
+    timer:sleep(1000),
+    pcache:get(Cache, "jim2"),
+    timer:sleep(100),
+    ?assertMatch(2, proplists:get_value(datum_count, pcache:stats(Cache))),
+    timer:sleep(1000),
+    ?assertMatch(1, proplists:get_value(datum_count, pcache:stats(Cache))),
+    timer:sleep(1000),
+    ?assertMatch(0, proplists:get_value(datum_count, pcache:stats(Cache))).
+    
+pcache_oldest_test_() ->
+  {setup, fun pcache_setup/0, fun pcache_cleanup/1,
+    {with, [fun check_reap_oldest/1]}
+  }.
+
+check_reap_oldest(Cache) ->
+    pcache:get(Cache, "jim1"),
+    timer:sleep(100),
+    pcache:get(Cache, "jim2"),
+    timer:sleep(100),
+    pcache:get(Cache, "jim3"),
+    timer:sleep(100),
+    ?assertMatch(3, proplists:get_value(datum_count, pcache:stats(Cache))),
+    Ages1 = lists:sort(gen_server:call(Cache, ages)),
+    gen_server:call(Cache, reap_oldest),
+    Ages2 = lists:sort(gen_server:call(Cache, ages)),
+    ?assertMatch(Ages2, tl(Ages1)).

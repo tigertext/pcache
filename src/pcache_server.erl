@@ -94,6 +94,12 @@ handle_call({get, Key}, From, #cache{} = State) ->
     DatumPid ! {get, From},
     {noreply, State};
 
+%% Only to allow for testing of reap_oldest
+handle_call(ages, _From, #cache{datum_index = DatumIndex} = State) ->
+    All_Datums = ets:foldl(fun({_UseKey, DatumPid, _Size}, Pids) -> [DatumPid | Pids] end, [], DatumIndex),
+    Ages = [get_age(Pid) || Pid <- All_Datums],
+    {reply, Ages, State};
+
 handle_call(total_size, _From, #cache{cache_used = Used} = State) ->
   {reply, Used, State};
 
@@ -114,24 +120,17 @@ handle_call(empty, _From, #cache{datum_index = DatumIndex} = State) ->
   {reply, Num_Destroyed, State};
 
 handle_call(reap_oldest, _From, #cache{datum_index = DatumIndex} = State) ->
-  GetOldest = fun({_UseKey, DatumPid, _Size}, {APid, Acc}) ->
-                Ref = make_ref(),
+    Ref = make_ref(),
+    Request_Timestamp_Fn =
+        fun({_UseKey, DatumPid, _Size}, Replies_Expected) ->
                 DatumPid ! {last_active, Ref, self()},
-                receive
-                  {last_active, Ref, DatumPid, LastActive} ->
-                    if
-                      Acc =< LastActive -> {APid, Acc};
-                      true -> {DatumPid, LastActive}
-                    end
-                 after 200 -> {APid, Acc}
-                 end
-               end,
-  {OldPid, _LActive} = ets:foldl(GetOldest, {false, {9999,0,0}}, DatumIndex),
-  case OldPid of
-    false -> no_datum;
-    _ -> Ref = make_ref(),
-         OldPid ! {destroy, Ref, self()}
-  end,
+                Replies_Expected + 1
+        end,
+    Datum_Count = ets:foldl(Request_Timestamp_Fn, 0, DatumIndex),
+    case filter_oldest(Ref, Datum_Count, calendar:time_to_seconds(now()), false) of
+        false      -> no_oldest_datum;
+        Oldest_Pid -> Oldest_Pid ! {destroy, Ref, self()}
+    end,
   {reply, ok, State};
 
 handle_call({rand, Type, Count}, _From, 
@@ -253,6 +252,24 @@ key(M, F, A) -> {M, F, A}.
 %% Private
 %% ===================================================================
 
+get_age(DatumPid) ->
+    Ref = make_ref(),
+    DatumPid ! {last_active, Ref, self()},
+    receive {last_active, Ref, DatumPid, Last_Active} -> {Last_Active, DatumPid}
+    after 20 -> no_response
+    end.
+    
+filter_oldest(_Ref, 0, _Oldest_Active, Oldest_Pid) -> Oldest_Pid;
+filter_oldest( Ref, N,  Oldest_Active, Oldest_Pid) ->
+    receive
+        {last_active, Ref, DatumPid, Last_Active} ->
+            case Last_Active < Oldest_Active of
+                true  -> filter_oldest(Ref, N-1, Last_Active,   DatumPid);
+                false -> filter_oldest(Ref, N-1, Oldest_Active, Oldest_Pid)
+            end
+    after 50 -> Oldest_Pid
+    end.
+
 new_data(DatumPid, NewData) -> new_data(DatumPid, NewData, 100).
 new_data(DatumPid, NewData, Timeout) ->
   Ref = make_ref(),
@@ -323,8 +340,8 @@ datum_launch(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy) ->
 update_ttl(#datum{started = Started, ttl = TTL, type = actual_time} = Datum) ->
 
     %% Get total time in seconds this datum has been running.  Convert to ms.
-    Now = now(),
-    Started_Now_Diff = (calendar:time_to_seconds(Now) - Started) * 1000,
+    Now = calendar:time_to_seconds(now()),
+    Started_Now_Diff = (Now - Started) * 1000,
 
     %% If we are less than the TTL, update with TTL-used (TTL in ms too)
     %% else, we ran out of time.  expire on next loop.
@@ -335,7 +352,7 @@ update_ttl(#datum{started = Started, ttl = TTL, type = actual_time} = Datum) ->
     Datum#datum{last_active = Now, remaining_ttl = TTL_Remaining};
 
 update_ttl(Datum) ->
-    Datum#datum{last_active = now()}.
+    Datum#datum{last_active = calendar:time_to_seconds(now())}.
 
 update_data(Datum, NewData) ->
   Datum#datum{data = NewData}.
@@ -375,7 +392,7 @@ datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
 
     {last_active, Ref, From} ->
       From ! {last_active, Ref, self(), LastActive},
-      continue(State);
+      continue_noreset(State);
 
     {destroy, Ref, From} ->
       From ! {destroy, Ref, self(), ok},
