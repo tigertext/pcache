@@ -42,7 +42,7 @@ start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy)
 
 
 %%%----------------------------------------------------------------------
-%%% Callback functions from gen_server
+%%% Init and gen_server state, terminate, code_change and locate functions
 %%%----------------------------------------------------------------------
 
 init([Name, Mod, Fun, CacheSize, CacheTime, CachePolicy]) ->
@@ -63,6 +63,9 @@ init([Name, Mod, Fun, CacheSize, CacheTime, CachePolicy]) ->
                  cache_used = 0},
   {ok, State}.
 
+code_change(_OldVsn, State, _Extra) -> {ok, State}.
+terminate(_Reason, _State) -> ok.
+
 locate(DatumKey, #cache{datum_index = DatumIndex, data_module = DataModule,
                   default_ttl = DefaultTTL, cache_policy = Policy, data_accessor = DataAccessor}) ->
   UseKey = key(DatumKey),
@@ -77,6 +80,20 @@ locate_memoize(DatumKey, DatumIndex, DataModule, DataAccessor, DefaultTTL, Polic
     [{UseKey, Pid, _Size}] when is_pid(Pid) -> Pid;
     [] -> launch_memoize_datum(DatumKey, UseKey, DatumIndex, DataModule, DataAccessor, DefaultTTL, Policy)
   end.
+
+key(Key) -> Key.
+key(M, F, A) -> {M, F, A}.
+
+
+%%%----------------------------------------------------------------------
+%%% handle_call messages
+%%%----------------------------------------------------------------------
+
+%% Only to allow for testing of reap_oldest
+handle_call(ages, _From, #cache{datum_index = DatumIndex} = State) ->
+    All_Datums = ets:foldl(fun({_UseKey, DatumPid, _Size}, Pids) -> [DatumPid | Pids] end, [], DatumIndex),
+    Ages = [get_age(Pid) || Pid <- All_Datums],
+    {reply, Ages, State};
 
 handle_call({location, DatumKey}, _From, State) -> 
   {reply, locate(DatumKey, State), State};
@@ -94,12 +111,6 @@ handle_call({get, Key}, From, #cache{} = State) ->
     DatumPid ! {get, From},
     {noreply, State};
 
-%% Only to allow for testing of reap_oldest
-handle_call(ages, _From, #cache{datum_index = DatumIndex} = State) ->
-    All_Datums = ets:foldl(fun({_UseKey, DatumPid, _Size}, Pids) -> [DatumPid | Pids] end, [], DatumIndex),
-    Ages = [get_age(Pid) || Pid <- All_Datums],
-    {reply, Ages, State};
-
 handle_call(total_size, _From, #cache{cache_used = Used} = State) ->
   {reply, Used, State};
 
@@ -107,8 +118,7 @@ handle_call(stats, _From, #cache{datum_index = DatumIndex} = State) ->
   EtsInfo = ets:info(DatumIndex),
   CacheName = proplists:get_value(name, EtsInfo),
   DatumCount = proplists:get_value(size, EtsInfo),
-  Stats = [{cache_name, CacheName},
-           {datum_count, DatumCount}],
+  Stats = [{cache_name, CacheName}, {datum_count, DatumCount}],
   {reply, Stats, State};
 
 handle_call(empty, _From, #cache{datum_index = DatumIndex} = State) ->
@@ -120,6 +130,8 @@ handle_call(empty, _From, #cache{datum_index = DatumIndex} = State) ->
   {reply, Num_Destroyed, State};
 
 handle_call(reap_oldest, _From, #cache{datum_index = DatumIndex} = State) ->
+
+    %% Send a 'last_active' request to all current cache datum pids...
     Ref = make_ref(),
     Request_Timestamp_Fn =
         fun({_UseKey, DatumPid, _Size}, Replies_Expected) ->
@@ -127,6 +139,8 @@ handle_call(reap_oldest, _From, #cache{datum_index = DatumIndex} = State) ->
                 Replies_Expected + 1
         end,
     Datum_Count = ets:foldl(Request_Timestamp_Fn, 0, DatumIndex),
+
+    %% Then filter the results coming back for the oldest one and destroy it.
     case filter_oldest(Ref, Datum_Count, calendar:time_to_seconds(now()), false) of
         false      -> no_oldest_datum;
         Oldest_Pid -> Oldest_Pid ! {destroy, Ref, self()}
@@ -156,8 +170,13 @@ handle_call({rand, Type, Count}, _From,
   end,
   {reply, FoundData, State};
   
-handle_call(Arbitrary, _From, State) ->
-  {reply, {arbitrary, Arbitrary}, State}.
+handle_call(Catch_All, _From, State) ->
+  {reply, {arbitrary, Catch_All}, State}.
+
+
+%%%----------------------------------------------------------------------
+%%% handle_cast messages
+%%%----------------------------------------------------------------------
 
 handle_cast({dirty, DatumKey, NewData}, #cache{datum_index = DatumIndex} = State) ->
     UseKey = key(DatumKey),
@@ -199,8 +218,9 @@ handle_cast({generic_dirty, M, F, A},
     %% TODO: What about cache_size?
   {noreply, State}.
 
-terminate(_Reason, _State) ->
-    ok.
+%%%----------------------------------------------------------------------
+%%% handle_info messages
+%%%----------------------------------------------------------------------
 
 %% New datum is inserted at 0 size initially, then updated with real size by a message.
 handle_info({new_datum_size, {UseKey, DatumPid, Size}},
@@ -239,13 +259,6 @@ handle_info({'DOWN', _Ref, process, DatumPid, _Reason},
 handle_info(_Info, State) ->
   %% io:format("Other info of: ~p~n", [Info]),
   {noreply, State}.
-
-code_change(_OldVsn, State, _Extra) ->
-  {ok, State}.
-
-
-key(Key) -> Key.
-key(M, F, A) -> {M, F, A}.
 
 
 %% ===================================================================
