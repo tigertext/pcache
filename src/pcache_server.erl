@@ -147,31 +147,23 @@ handle_call(reap_oldest, _From, #cache{datum_index = DatumIndex} = State) ->
     end,
   {reply, ok, State};
 
-handle_call({rand, Type, Count}, _From, 
-  #cache{datum_index = DatumIndex} = State) ->
-  AllPids = case ets:match(DatumIndex, {'_', '$1', '_'}) of
-              [] -> [];
-              Found -> lists:flatten(Found)
-            end, 
-  Length = length(AllPids),
-  FoundData = 
-  case Length =< Count of
-    true  -> case Type of
-               data -> [get_data(P) || P <- AllPids];
-               keys -> [get_key(P) || P <- AllPids]
-             end;
-    false ->  RandomSet  = [crypto:rand_uniform(1, Length) || 
-                              _ <- lists:seq(1, Count)],
-              RandomPids = [lists:nth(Q, AllPids) || Q <- RandomSet],
-              case Type of
-                data -> [get_data(P) || P <- RandomPids];
-                keys -> [get_key(P) || P <- RandomPids]
-              end
-  end,
-  {reply, FoundData, State};
+handle_call({rand, Type, Num_Desired}, _From, #cache{datum_index = DatumIndex} = State) ->
+    {size, Datum_Count} = ets:info(DatumIndex, size),
+    Indices = [crypto:rand_uniform(1, Datum_Count+1) || _ <- lists:seq(1, Num_Desired)],
+    {Rand_Pids, _Last_Pos, []} =
+        ets:foldl(fun({_UseKey, Datum_Pid, _Size}, {Pids, Ets_Item_Pos, Wanted_Pid_Positions}) ->
+                          Fetch_Positions = lists:takewhile(fun(Pos) -> Pos =:= Ets_Item_Pos end, Wanted_Pid_Positions),
+                          Fetch_Pids = lists:duplicate(length(Fetch_Positions), Datum_Pid),
+                          {Fetch_Pids ++ Pids, Ets_Item_Pos+1, Wanted_Pid_Positions -- Fetch_Pids}
+                  end, {[], 1, Indices}, DatumIndex),
+    Rand_Data = case Type of
+                     data -> [get_data(P) || P <- Rand_Pids];
+                     keys -> [get_key(P)  || P <- Rand_Pids]
+                 end,
+    {reply, Rand_Data, State};
   
 handle_call(Catch_All, _From, State) ->
-  {reply, {arbitrary, Catch_All}, State}.
+    {reply, {arbitrary, Catch_All}, State}.
 
 
 %%%----------------------------------------------------------------------
