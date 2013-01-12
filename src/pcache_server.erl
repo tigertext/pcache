@@ -148,14 +148,14 @@ handle_call(reap_oldest, _From, #cache{datum_index = DatumIndex} = State) ->
   {reply, ok, State};
 
 handle_call({rand, Type, Num_Desired}, _From, #cache{datum_index = DatumIndex} = State) ->
-    {size, Datum_Count} = ets:info(DatumIndex, size),
+    Datum_Count = ets:info(DatumIndex, size),
     Indices = [crypto:rand_uniform(1, Datum_Count+1) || _ <- lists:seq(1, Num_Desired)],
     {Rand_Pids, _Last_Pos, []} =
         ets:foldl(fun({_UseKey, Datum_Pid, _Size}, {Pids, Ets_Item_Pos, Wanted_Pid_Positions}) ->
                           Fetch_Positions = lists:takewhile(fun(Pos) -> Pos =:= Ets_Item_Pos end, Wanted_Pid_Positions),
                           Fetch_Pids = lists:duplicate(length(Fetch_Positions), Datum_Pid),
-                          {Fetch_Pids ++ Pids, Ets_Item_Pos+1, Wanted_Pid_Positions -- Fetch_Pids}
-                  end, {[], 1, Indices}, DatumIndex),
+                          {Fetch_Pids ++ Pids, Ets_Item_Pos+1, Wanted_Pid_Positions -- Fetch_Positions}
+                  end, {[], 1, lists:sort(Indices)}, DatumIndex),
     Rand_Data = case Type of
                      data -> [get_data(P) || P <- Rand_Pids];
                      keys -> [get_key(P)  || P <- Rand_Pids]
@@ -376,12 +376,22 @@ datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
       Mgr ! {InvalidMgrRequest, Ref, self(), invalid_creator_request},
       continue(State);
 
+    %% Get messages used to fulfill pcache_server:handle_call requests...
     {get, Gen_Server_From} ->
       gen_server:reply(Gen_Server_From, Data),
       continue(State);
 
     {getkey, Gen_Server_From} ->
       gen_server:reply(Gen_Server_From, Key),
+      continue(State);
+
+    %% Get messages used to fulfill pcache_server:rand collection of values...
+    {get, Ref, From} ->
+      From ! {get, Ref, self(), Data},
+      continue(State);
+
+    {getkey, Ref, From} ->
+      From ! {getkey, Ref, self(), Key},
       continue(State);
 
     {memsize, Ref, From} ->

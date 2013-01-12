@@ -1,13 +1,16 @@
 -module(pcache_tests).
 -include_lib("eunit/include/eunit.hrl").
 
--export([tester/1, memoize_tester/1, slow_tester/1]).
+-export([tester/1, memoize_tester/1, slow_tester/1, lookup_tester/1]).
 
 %% Spawned functions
 -export([notify/3]).
 
 -define(E(A, B), ?assertEqual(A, B)).
 -define(_E(A, B), ?_assertEqual(A, B)).
+
+tester(Key) when is_binary(Key) orelse is_list(Key) -> erlang:md5(Key).
+memoize_tester(Key) when is_binary(Key) orelse is_list(Key) -> erlang:crc32(Key).
 
 pcache_setup() ->
   %% start cache server tc (test cache), 6 MB cache, 5 minute TTL per entry (300 seconds)
@@ -18,12 +21,6 @@ pcache_cleanup(Cache) ->
     pcache:empty(Cache),
     unregister(tc),
     exit(Cache, normal).
-
-tester(Key) when is_binary(Key) orelse is_list(Key) ->
-  erlang:md5(Key).
-
-memoize_tester(Key) when is_binary(Key) orelse is_list(Key) ->
-  erlang:crc32(Key).
 
 pcache_test_() ->
   {foreach, fun pcache_setup/0, fun pcache_cleanup/1,
@@ -223,3 +220,52 @@ check_reap_oldest(Cache) ->
     gen_server:call(Cache, reap_oldest),
     Ages2 = lists:sort(gen_server:call(Cache, ages)),
     ?assertMatch(Ages2, tl(Ages1)).
+
+
+%%% =======================================================================
+%%% Test random values
+%%% =======================================================================
+    
+lookup_tester("fred1") -> 1;
+lookup_tester("fred2") -> 2;
+lookup_tester("fred3") -> 3;
+lookup_tester("fred4") -> 4;
+lookup_tester("fred5") -> 5;
+lookup_tester("fred6") -> 6.
+
+pcache_lookup_setup() ->
+  %% start cache server tc (test cache), 6 MB cache, 5 minute TTL per entry (300 seconds)
+  {ok, Pid} = pcache_server:start_link(tc, ?MODULE, lookup_tester, 6, 300000),
+  Pid.
+
+pcache_random_test_() ->
+  {setup, fun pcache_lookup_setup/0, fun pcache_cleanup/1,
+    {with, [fun check_rand/1]}
+  }.
+
+check_rand(Cache) ->
+    pcache:get(Cache, "fred1"),
+    pcache:get(Cache, "fred2"),
+    pcache:get(Cache, "fred3"),
+    pcache:get(Cache, "fred4"),
+    pcache:get(Cache, "fred5"),
+    pcache:get(Cache, "fred6"),
+    timer:sleep(100),
+    ?assertMatch(6, proplists:get_value(datum_count, pcache:stats(Cache))),
+
+    Rand_Val_1 = [Value || {ok, Value} <- pcache:rand(Cache, 3)],
+    Rand_Val_2 = [Value || {ok, Value} <- pcache:rand(Cache, 3)],
+    ?assertMatch(3, length([V || V <- Rand_Val_1, is_integer(V), V > 0, V < 7])),
+    ?assertMatch(3, length(Rand_Val_1)),
+    ?assertMatch(3, length([V || V <- Rand_Val_2, is_integer(V), V > 0, V < 7])),
+    ?assertMatch(3, length(Rand_Val_2)),
+    ?assert(Rand_Val_1 =/= Rand_Val_2),
+
+    Rand_Key_1 = [Key || {ok, Key} <- pcache:rand_keys(Cache, 3)],
+    Rand_Key_2 = [Key || {ok, Key} <- pcache:rand_keys(Cache, 3)],
+    ?assertMatch(3, length([K || K <- Rand_Key_1, string:substr(K, 1, 4) == "fred"])),
+    ?assertMatch(3, length(Rand_Key_1)),
+    ?assertMatch(3, length([K || K <- Rand_Key_2, string:substr(K, 1, 4) == "fred"])),
+    ?assertMatch(3, length(Rand_Key_2)),
+    ?assert(Rand_Key_1 =/= Rand_Key_2).
+    
