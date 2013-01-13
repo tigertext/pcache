@@ -42,7 +42,7 @@ start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy)
 
 
 %%%----------------------------------------------------------------------
-%%% Callback functions from gen_server
+%%% Init and gen_server state, terminate, code_change and locate functions
 %%%----------------------------------------------------------------------
 
 init([Name, Mod, Fun, CacheSize, CacheTime, CachePolicy]) ->
@@ -63,6 +63,9 @@ init([Name, Mod, Fun, CacheSize, CacheTime, CachePolicy]) ->
                  cache_used = 0},
   {ok, State}.
 
+code_change(_OldVsn, State, _Extra) -> {ok, State}.
+terminate(_Reason, _State) -> ok.
+
 locate(DatumKey, #cache{datum_index = DatumIndex, data_module = DataModule,
                   default_ttl = DefaultTTL, cache_policy = Policy, data_accessor = DataAccessor}) ->
   UseKey = key(DatumKey),
@@ -77,6 +80,20 @@ locate_memoize(DatumKey, DatumIndex, DataModule, DataAccessor, DefaultTTL, Polic
     [{UseKey, Pid, _Size}] when is_pid(Pid) -> Pid;
     [] -> launch_memoize_datum(DatumKey, UseKey, DatumIndex, DataModule, DataAccessor, DefaultTTL, Policy)
   end.
+
+key(Key) -> Key.
+key(M, F, A) -> {M, F, A}.
+
+
+%%%----------------------------------------------------------------------
+%%% handle_call messages
+%%%----------------------------------------------------------------------
+
+%% Only to allow for testing of reap_oldest
+handle_call(ages, _From, #cache{datum_index = DatumIndex} = State) ->
+    All_Datums = ets:foldl(fun({_UseKey, DatumPid, _Size}, Pids) -> [DatumPid | Pids] end, [], DatumIndex),
+    Ages = [get_age(Pid) || Pid <- All_Datums],
+    {reply, Ages, State};
 
 handle_call({location, DatumKey}, _From, State) -> 
   {reply, locate(DatumKey, State), State};
@@ -101,8 +118,7 @@ handle_call(stats, _From, #cache{datum_index = DatumIndex} = State) ->
   EtsInfo = ets:info(DatumIndex),
   CacheName = proplists:get_value(name, EtsInfo),
   DatumCount = proplists:get_value(size, EtsInfo),
-  Stats = [{cache_name, CacheName},
-           {datum_count, DatumCount}],
+  Stats = [{cache_name, CacheName}, {datum_count, DatumCount}],
   {reply, Stats, State};
 
 handle_call(empty, _From, #cache{datum_index = DatumIndex} = State) ->
@@ -114,94 +130,85 @@ handle_call(empty, _From, #cache{datum_index = DatumIndex} = State) ->
   {reply, Num_Destroyed, State};
 
 handle_call(reap_oldest, _From, #cache{datum_index = DatumIndex} = State) ->
-  GetOldest = fun({_UseKey, DatumPid, _Size}, {APid, Acc}) ->
-                Ref = make_ref(),
+
+    %% Send a 'last_active' request to all current cache datum pids...
+    Ref = make_ref(),
+    Request_Timestamp_Fn =
+        fun({_UseKey, DatumPid, _Size}, Replies_Expected) ->
                 DatumPid ! {last_active, Ref, self()},
-                receive
-                  {last_active, Ref, DatumPid, LastActive} ->
-                    if
-                      Acc =< LastActive -> {APid, Acc};
-                      true -> {DatumPid, LastActive}
-                    end
-                 after 200 -> {APid, Acc}
-                 end
-               end,
-  {OldPid, _LActive} = ets:foldl(GetOldest, {false, {9999,0,0}}, DatumIndex),
-  case OldPid of
-    false -> no_datum;
-    _ -> Ref = make_ref(),
-         OldPid ! {destroy, Ref, self()}
-  end,
+                Replies_Expected + 1
+        end,
+    Datum_Count = ets:foldl(Request_Timestamp_Fn, 0, DatumIndex),
+
+    %% Then filter the results coming back for the oldest one and destroy it.
+    case filter_oldest(Ref, Datum_Count, calendar:time_to_seconds(now()), false) of
+        false      -> no_oldest_datum;
+        Oldest_Pid -> Oldest_Pid ! {destroy, Ref, self()}
+    end,
   {reply, ok, State};
 
-handle_call({rand, Type, Count}, _From, 
-  #cache{datum_index = DatumIndex} = State) ->
-  AllPids = case ets:match(DatumIndex, {'_', '$1', '_'}) of
-              [] -> [];
-              Found -> lists:flatten(Found)
-            end, 
-  Length = length(AllPids),
-  FoundData = 
-  case Length =< Count of
-    true  -> case Type of
-               data -> [get_data(P) || P <- AllPids];
-               keys -> [get_key(P) || P <- AllPids]
-             end;
-    false ->  RandomSet  = [crypto:rand_uniform(1, Length) || 
-                              _ <- lists:seq(1, Count)],
-              RandomPids = [lists:nth(Q, AllPids) || Q <- RandomSet],
-              case Type of
-                data -> [get_data(P) || P <- RandomPids];
-                keys -> [get_key(P) || P <- RandomPids]
-              end
-  end,
-  {reply, FoundData, State};
+handle_call({rand, Type, Num_Desired}, _From, #cache{datum_index = DatumIndex} = State) ->
+    Datum_Count = ets:info(DatumIndex, size),
+    Indices = [crypto:rand_uniform(1, Datum_Count+1) || _ <- lists:seq(1, Num_Desired)],
+    {Rand_Pids, _Last_Pos, []} =
+        ets:foldl(fun(_Ets_Entry, {Pids, Ets_Item_Pos, []}) -> {Pids, Ets_Item_Pos+1, []};
+                     ({_UseKey, Datum_Pid, _Size}, {Pids, Ets_Item_Pos, Wanted_Pid_Positions}) ->
+                          Fetch_Positions = lists:takewhile(fun(Pos) -> Pos =:= Ets_Item_Pos end, Wanted_Pid_Positions),
+                          Fetch_Pids = lists:duplicate(length(Fetch_Positions), Datum_Pid),
+                          {Fetch_Pids ++ Pids, Ets_Item_Pos+1, Wanted_Pid_Positions -- Fetch_Positions}
+                  end, {[], 1, lists:sort(Indices)}, DatumIndex),
+    Rand_Data = case Type of
+                     data -> [get_data(P) || P <- Rand_Pids];
+                     keys -> [get_key(P)  || P <- Rand_Pids]
+                 end,
+    {reply, Rand_Data, State};
   
-handle_call(Arbitrary, _From, State) ->
-  {reply, {arbitrary, Arbitrary}, State}.
+handle_call(Catch_All, _From, State) ->
+    {reply, {arbitrary, Catch_All}, State}.
 
-handle_cast({dirty, DatumKey, NewData}, #cache{datum_index = DatumIndex} = State) ->
+
+%%%----------------------------------------------------------------------
+%%% handle_cast messages
+%%%----------------------------------------------------------------------
+
+handle_cast({dirty, DatumKey, NewData},
+            #cache{datum_index = DatumIndex, cache_used = Used} = State) ->
     UseKey = key(DatumKey),
     case ets:lookup(DatumIndex, UseKey) of
-        [{UseKey, DatumPid, _Size}] -> new_data(DatumPid, NewData);
-        [] -> noop
-    end,
-    %% TODO: What about cache_size?
-    {noreply, State};
+        [] -> {noreply, State};
+        [{UseKey, DatumPid, Size}] ->
+            DatumPid ! {new_data, make_ref(), self(), NewData},
+            %% Cache size is incremented by handle_info new_datum_size message
+            {noreply, State#cache{cache_used = Used - Size}}
+    end;
 
-handle_cast({dirty, DatumKey}, #cache{datum_index = DatumIndex, cache_used=Used} = State) ->
+handle_cast({dirty, DatumKey}, #cache{datum_index = DatumIndex} = State) ->
     UseKey = key(DatumKey),
-    New_Size = case ets:lookup(DatumIndex, UseKey) of
-    [{UseKey, DatumPid, Size}] -> Ref = make_ref(),
-                         DatumPid ! {destroy, Ref, self()},
-                   receive 
-                     {destroy, Ref, DatumPid, ok} -> ets:delete(DatumIndex, UseKey),
-                                                Used - Size
-                   after 
-                     100 -> Used 
-                   end;
-    [] -> Used 
-  end,
-  {noreply, State#cache{cache_used = New_Size}};
+    case ets:lookup(DatumIndex, UseKey) of
+        [] -> noop;
+        [{UseKey, DatumPid, _Size}] ->
+            Ref = make_ref(),
+            DatumPid ! {destroy, Ref, self()}
+    end,
+    %% Cache size is updated by handle_info 'DOWN' message
+    {noreply, State};
 
 handle_cast({generic_dirty, M, F, A},
     #cache{datum_index = DatumIndex} = State) ->
     UseKey = key(M, F, A),
     case ets:lookup(DatumIndex, UseKey) of
-        [{UseKey, DatumPid, _}] -> Ref = make_ref(),
-                             DatumPid ! {destroy, Ref, self()},
-                   receive 
-                     {destroy, Ref, DatumPid, ok} -> ok
-                   after 
-                     100 -> fail
-                   end;
-    [] -> ok
-  end,
-    %% TODO: What about cache_size?
-  {noreply, State}.
+        [] -> noop;
+        [{UseKey, DatumPid, _}] ->
+            Ref = make_ref(),
+            DatumPid ! {destroy, Ref, self()}
+    end,
+    %% Cache size is updated by handle_info 'DOWN' message
+    {noreply, State}.
 
-terminate(_Reason, _State) ->
-    ok.
+
+%%%----------------------------------------------------------------------
+%%% handle_info messages
+%%%----------------------------------------------------------------------
 
 %% New datum is inserted at 0 size initially, then updated with real size by a message.
 handle_info({new_datum_size, {UseKey, DatumPid, Size}},
@@ -219,7 +226,7 @@ handle_info({'DOWN', _Ref, process, ReaperPid, _Reason},
   {noreply, State#cache{reaper_pid = NewReaperPid}};
 
 handle_info({'DOWN', _Ref, process, DatumPid, _Reason},
-    #cache{datum_index = DatumIndex, cache_used=Used} = State) ->
+    #cache{datum_index = DatumIndex, cache_used = Used} = State) ->
 
   %% Remove the _one_ pending 'new_datum_size' message, if it exists...
   receive {new_datum_size, {_UseKey, DatumPid, _Size}} -> noop
@@ -241,25 +248,28 @@ handle_info(_Info, State) ->
   %% io:format("Other info of: ~p~n", [Info]),
   {noreply, State}.
 
-code_change(_OldVsn, State, _Extra) ->
-  {ok, State}.
-
-
-key(Key) -> Key.
-key(M, F, A) -> {M, F, A}.
-
 
 %% ===================================================================
 %% Private
 %% ===================================================================
 
-new_data(DatumPid, NewData) -> new_data(DatumPid, NewData, 100).
-new_data(DatumPid, NewData, Timeout) ->
-  Ref = make_ref(),
-  DatumPid ! {new_data, Ref, self(), NewData},
-  receive {new_data, Ref, DatumPid, _OldData} -> ok
-  after Timeout -> fail
-  end.
+get_age(DatumPid) ->
+    Ref = make_ref(),
+    DatumPid ! {last_active, Ref, self()},
+    receive {last_active, Ref, DatumPid, Last_Active} -> {Last_Active, DatumPid}
+    after 20 -> no_response
+    end.
+    
+filter_oldest(_Ref, 0, _Oldest_Active, Oldest_Pid) -> Oldest_Pid;
+filter_oldest( Ref, N,  Oldest_Active, Oldest_Pid) ->
+    receive
+        {last_active, Ref, DatumPid, Last_Active} ->
+            case Last_Active < Oldest_Active of
+                true  -> filter_oldest(Ref, N-1, Last_Active,   DatumPid);
+                false -> filter_oldest(Ref, N-1, Oldest_Active, Oldest_Pid)
+            end
+    after 50 -> Oldest_Pid
+    end.
 
 get_data(DatumPid) -> get_data(DatumPid, 100).
 get_data(DatumPid, Timeout) ->
@@ -308,23 +318,24 @@ launch_memoize_datum(DatumKey, UseKey, EtsIndex, Module, Accessor, TTL, CachePol
   ets:insert(EtsIndex, {UseKey, Datum_Pid, 0}),
   Datum_Pid.
 
-
-%%% =======================================================================
-%%% Datum launch and message response functions
-%%% =======================================================================
-
 datum_launch(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy) ->
     Datum = make_new_datum(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy),
     Datum_Pid = self(),
-    {_, Size} = process_info(Datum_Pid, memory),
+    garbage_collect(),
+    {memory, Size} = process_info(Datum_Pid, memory),
     Cache_Server ! {new_datum_size, {UseKey, Datum_Pid, Size}},
     datum_loop(Datum).
+
+
+%%% =======================================================================
+%%% Datum pid internal state management and main receive loop
+%%% =======================================================================
 
 update_ttl(#datum{started = Started, ttl = TTL, type = actual_time} = Datum) ->
 
     %% Get total time in seconds this datum has been running.  Convert to ms.
-    Now = now(),
-    Started_Now_Diff = (calendar:time_to_seconds(Now) - Started) * 1000,
+    Now = calendar:time_to_seconds(now()),
+    Started_Now_Diff = (Now - Started) * 1000,
 
     %% If we are less than the TTL, update with TTL-used (TTL in ms too)
     %% else, we ran out of time.  expire on next loop.
@@ -334,35 +345,54 @@ update_ttl(#datum{started = Started, ttl = TTL, type = actual_time} = Datum) ->
                     end,
     Datum#datum{last_active = Now, remaining_ttl = TTL_Remaining};
 
-update_ttl(Datum) ->
-    Datum#datum{last_active = now()}.
+update_ttl(#datum{} = Datum) ->
+    Datum#datum{last_active = calendar:time_to_seconds(now())}.
 
-update_data(Datum, NewData) ->
+update_data(#datum{} = Datum, NewData) ->
   Datum#datum{data = NewData}.
     
-continue(Datum) ->
+continue(#datum{} = Datum) ->
   datum_loop(update_ttl(Datum)).
 
-continue_noreset(Datum) ->
+continue_noreset(#datum{} = Datum) ->
   datum_loop(Datum).
 
+%% Give process a chance to discard old #datum{} before notifying.
+datum_size_notify(Mgr, #datum{key = Key} = Datum) ->
+    garbage_collect(),
+    {memory, Size} = process_info(self(), memory),
+    Mgr ! {new_datum_size, {Key, self(), Size}},
+    datum_loop(Datum).
+
+%% Main loop for datum replies and updates.    
 datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
             data = Data, remaining_ttl = TTL} = State) ->
   receive
-    {new_data, Ref, Mgr, Replacement} ->
-      Mgr ! {new_data, Ref, self(), Data},
-      continue(update_data(Replacement, State));
+    {new_data, _Ref, Mgr, Replacement} ->
+      New_Datum = update_data(State, Replacement),
+      datum_size_notify(Mgr, update_ttl(New_Datum));
 
+    %% Presumably bad code elsewhere, but intent is for datum to be activated...
     {InvalidMgrRequest, Ref, Mgr, _Other} ->
       Mgr ! {InvalidMgrRequest, Ref, self(), invalid_creator_request},
       continue(State);
 
+    %% Get messages used to fulfill pcache_server:handle_call requests...
     {get, Gen_Server_From} ->
       gen_server:reply(Gen_Server_From, Data),
       continue(State);
 
     {getkey, Gen_Server_From} ->
       gen_server:reply(Gen_Server_From, Key),
+      continue(State);
+
+    %% Get messages used to fulfill pcache_server:rand collection of values...
+    {get, Ref, From} ->
+      From ! {get, Ref, self(), Data},
+      continue(State);
+
+    {getkey, Ref, From} ->
+      From ! {getkey, Ref, self(), Key},
       continue(State);
 
     {memsize, Ref, From} ->
@@ -375,13 +405,14 @@ datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
 
     {last_active, Ref, From} ->
       From ! {last_active, Ref, self(), LastActive},
-      continue(State);
+      continue_noreset(State);
 
     {destroy, Ref, From} ->
       From ! {destroy, Ref, self(), ok},
       % io:format("destroying ~p with last access of ~p~n", [self(), LastActive]),
       exit(self(), destroy);
 
+    %% Presumably bad code elsewhere, but intent is for datum to be activated...
     {InvalidRequest, Ref, From} ->
       From ! {InvalidRequest, Ref, self(), invalid_request},
       continue(State);
