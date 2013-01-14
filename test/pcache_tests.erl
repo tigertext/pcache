@@ -73,6 +73,7 @@ check_cache_size(Cache) ->
     ?assert(Size3 > Size2),
 
     ?assertMatch(2, pcache:empty(Cache)),
+    timer:sleep(10),
     ?assertMatch(0, pcache:total_size(Cache)).
 
   
