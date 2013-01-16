@@ -303,8 +303,15 @@ create_datum(Cache_Server, Key, Data, TTL, Type) ->
          remaining_ttl = TTL, type = Type, started = calendar:time_to_seconds(now())}.
 
 make_new_datum(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy) ->
-  CacheData = Module:Accessor(Key),
-  create_datum(Cache_Server, UseKey, CacheData, TTL, CachePolicy).
+    try
+        CacheData = Module:Accessor(Key),
+        create_datum(Cache_Server, UseKey, CacheData, TTL, CachePolicy)
+    catch Class:Error ->
+            Crash_Args = [Module, Accessor, Key, Class, Error],
+            Crash_String = lists:flatten(io_lib:format("** ~p:~p(~p) Crashed! ~p:~p **", Crash_Args)),
+            error_logger:error_msg("~p:make_new_datum ~p~n", [?MODULE, Crash_String]),
+            exit(crashed)
+    end.
 
 launch_datum(DatumKey, UseKey, EtsIndex, Module, Accessor, TTL, CachePolicy) ->
   Datum_Args = [self(), DatumKey, UseKey, Module, Accessor, TTL, CachePolicy],
