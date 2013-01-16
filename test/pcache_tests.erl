@@ -1,13 +1,15 @@
 -module(pcache_tests).
 -include_lib("eunit/include/eunit.hrl").
 
--export([tester/1, memoize_tester/1, slow_tester/1, lookup_tester/1]).
+-export([tester/1, memoize_tester/1, slow_tester/1, lookup_tester/1, crash_tester/1]).
 
 %% Spawned functions
 -export([notify/3]).
 
--define(E(A, B), ?assertEqual(A, B)).
--define(_E(A, B), ?_assertEqual(A, B)).
+
+%%% =======================================================================
+%%% Test basic get/dirty, cache_size and crash tolerance
+%%% =======================================================================
 
 tester(Key) when is_binary(Key) orelse is_list(Key) -> erlang:md5(Key).
 memoize_tester(Key) when is_binary(Key) orelse is_list(Key) -> erlang:crc32(Key).
@@ -76,6 +78,22 @@ check_cache_size(Cache) ->
     timer:sleep(10),
     ?assertMatch(0, pcache:total_size(Cache)).
 
+crash_tester(Key) -> Key ++ " broke me".
+
+pcache_datum_crash_setup() ->
+  {ok, Pid} = pcache_server:start_link(tc, ?MODULE, crash_tester, 6, 300000),
+  Pid.
+
+pcache_datum_crash_test_() ->
+  {setup, fun pcache_datum_crash_setup/0, fun pcache_cleanup/1,
+   {with, [fun check_mfa_crash/1]}
+  }.
+
+check_mfa_crash(Cache) ->
+%%    ?assertMatch('** pcache_tests:crash_tester(<<"Binary_Token">>) Crashed! error:badarg **',
+    ?assertExit(timeout, pcache:get(Cache, <<"Binary_Token">>)),
+    ok.
+    
   
 
 %%% =======================================================================
@@ -84,7 +102,7 @@ check_cache_size(Cache) ->
 pcache_queue_test_() ->
     {setup, fun pcache_setup/0, fun pcache_cleanup/1,
      {with, [fun check_msg_queue_speed/1]}
-     }.
+    }.
 
 load_msg_queue(Cache, Key, Num_Requesters, Caller) ->
     Notify_Fn = fun() -> Caller ! {datum, pcache:get(Cache, Key)} end,
