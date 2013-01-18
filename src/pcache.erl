@@ -1,7 +1,9 @@
 -module(pcache).
 -compile(export_all).
 
--export([get/2, empty/1, total_size/1, stats/1, dirty/2, dirty/3, 
+-export([get/2, get/3,
+         empty/1, total_size/1, stats/1,
+         dirty/2, dirty/3, 
          rand/2, rand_keys/2]).
 
 -export([memoize/4, dirty_memoize/4]).
@@ -24,8 +26,13 @@ cache_ttl_sup(Name, Mod, Fun, Size, TTL) ->
 %% Calls into pcache_server
 %% ===================================================================
 
+-define(FAST_TIMEOUT, 500).
+
 get(ServerName, Key) ->
-  gen_server:call(ServerName, {get, Key}).
+  gen_server:call(ServerName, {get, Key}, ?FAST_TIMEOUT).
+
+get(ServerName, Key, Timeout) ->
+  gen_server:call(ServerName, {get, Key}, Timeout).
 
 memoize(MemoizeCacheServer, Module, Fun, Key) ->
   gen_server:call(MemoizeCacheServer, {generic_get, Module, Fun, Key}).
