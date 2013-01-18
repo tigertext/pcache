@@ -91,7 +91,7 @@ pcache_datum_crash_test_() ->
 
 check_mfa_crash(Cache) ->
 %%    ?assertMatch('** pcache_tests:crash_tester(<<"Binary_Token">>) Crashed! error:badarg **',
-    ?assertExit(timeout, pcache:get(Cache, <<"Binary_Token">>)),
+    ?assertException(exit,{timeout,_}, pcache:get(Cache, <<"Binary_Token">>)),
     ok.
     
   
@@ -184,7 +184,7 @@ get_key_results(Count, Results) ->
     
 check_spawn_speed(Cache) ->
     Existing_Result = erlang:md5("existing_key"),
-    {Micros_Existing, Get_Existing_New} = timer:tc(fun() -> pcache:get(Cache, "existing_key") end),
+    {Micros_Existing, Get_Existing_New} = timer:tc(fun() -> pcache:get(Cache, "existing_key", 2000) end),
     ?assertMatch(Existing_Result, Get_Existing_New),
     ?assert((?SLOW * 1000) < Micros_Existing),
 
