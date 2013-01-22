@@ -307,8 +307,8 @@ make_new_datum(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy) ->
         CacheData = Module:Accessor(Key),
         create_datum(Cache_Server, UseKey, CacheData, TTL, CachePolicy)
     catch Class:Error ->
-            Crash_Args = [Module, Accessor, Key, Class, Error],
-            Crash_String = lists:flatten(io_lib:format("** ~p:~p(~p) Crashed! ~p:~p **", Crash_Args)),
+            Crash_Args = [Module, Accessor, Key, Class, Error, erlang:get_stacktrace()],
+            Crash_String = lists:flatten(io_lib:format("** ~p:~p(~p) Crashed! ~p:~p **~nStacktrace:~p~n", Crash_Args)),
             error_logger:error_msg("~p:make_new_datum ~p~n", [?MODULE, Crash_String]),
             exit(crashed)
     end.
