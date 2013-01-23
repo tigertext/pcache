@@ -124,10 +124,12 @@ handle_call(stats, _From, #cache{datum_index = DatumIndex} = State) ->
 handle_call(empty, _From, #cache{datum_index = DatumIndex} = State) ->
     %% We don't wait synchronously, so the make_ref() is just for a consistent interface message.
     Ref = make_ref(),
-    Num_Destroyed = ets:foldl(fun({_DatumKey, DatumPid, _Size}, Num) ->
-                                      DatumPid ! {destroy, Ref, self()}, Num+1
-                              end, 0, DatumIndex),
-  {reply, Num_Destroyed, State};
+    Items_Destroyed = ets:foldl(fun({DatumKey, DatumPid, _Size}, Items) ->
+                                        DatumPid ! {destroy, Ref, self()},
+                                        [DatumKey | Items]
+                                end, [], DatumIndex),
+    _ = [ets:delete(DatumIndex, Key) || Key <- Items_Destroyed],
+    {reply, length(Items_Destroyed), State#cache{cache_used = 0}};
 
 handle_call(reap_oldest, _From, #cache{datum_index = DatumIndex} = State) ->
 
@@ -141,11 +143,14 @@ handle_call(reap_oldest, _From, #cache{datum_index = DatumIndex} = State) ->
     Datum_Count = ets:foldl(Request_Timestamp_Fn, 0, DatumIndex),
 
     %% Then filter the results coming back for the oldest one and destroy it.
-    case filter_oldest(Ref, Datum_Count, calendar:time_to_seconds(now()), false) of
-        false      -> no_oldest_datum;
-        Oldest_Pid -> Oldest_Pid ! {destroy, Ref, self()}
-    end,
-  {reply, ok, State};
+    NewState = case filter_oldest(Ref, Datum_Count, calendar:time_to_seconds(now()), false) of
+                   false -> State;
+                   Oldest_Pid ->
+                       Oldest_Pid ! {destroy, Ref, self()},
+                       %% There can only be 1 entry in an ets 'set' table, so don't scan full table.
+                       delete_one_ets_entry_by_pid(DatumIndex, Oldest_Pid, State)
+               end,
+    {reply, ok, NewState};
 
 handle_call({rand, Type, Num_Desired}, _From, #cache{datum_index = DatumIndex} = State) ->
     Datum_Count = ets:info(DatumIndex, size),
@@ -178,32 +183,38 @@ handle_cast({dirty, DatumKey, NewData},
         [] -> {noreply, State};
         [{UseKey, DatumPid, Size}] ->
             DatumPid ! {new_data, make_ref(), self(), NewData},
+            %% Pid doesn't change, so no update to ets index
             %% Cache size is incremented by handle_info new_datum_size message
             {noreply, State#cache{cache_used = Used - Size}}
     end;
 
-handle_cast({dirty, DatumKey}, #cache{datum_index = DatumIndex} = State) ->
+handle_cast({dirty, DatumKey},
+            #cache{datum_index = DatumIndex, cache_used = Used} = State) ->
     UseKey = key(DatumKey),
     case ets:lookup(DatumIndex, UseKey) of
-        [] -> noop;
-        [{UseKey, DatumPid, _Size}] ->
+        [] -> {noreply, State};
+
+        %% Atomically update the ets / size / pid
+        [{UseKey, DatumPid, Size}] ->
             Ref = make_ref(),
-            DatumPid ! {destroy, Ref, self()}
-    end,
-    %% Cache size is updated by handle_info 'DOWN' message
-    {noreply, State};
+            DatumPid ! {destroy, Ref, self()},
+            ets:delete(DatumIndex, UseKey),
+            {noreply, State#cache{cache_used = Used - Size}}
+    end;
 
 handle_cast({generic_dirty, M, F, A},
-    #cache{datum_index = DatumIndex} = State) ->
+            #cache{datum_index = DatumIndex, cache_used = Used} = State) ->
     UseKey = key(M, F, A),
     case ets:lookup(DatumIndex, UseKey) of
-        [] -> noop;
-        [{UseKey, DatumPid, _}] ->
+        [] -> {noreply, State};
+
+        %% Atomically update the ets / size / pid
+        [{UseKey, DatumPid, Size}] ->
             Ref = make_ref(),
-            DatumPid ! {destroy, Ref, self()}
-    end,
-    %% Cache size is updated by handle_info 'DOWN' message
-    {noreply, State}.
+            DatumPid ! {destroy, Ref, self()},
+            ets:delete(DatumIndex, UseKey),
+            {noreply, State#cache{cache_used = Used - Size}}
+    end.
 
 
 %%%----------------------------------------------------------------------
@@ -226,7 +237,7 @@ handle_info({'DOWN', _Ref, process, ReaperPid, _Reason},
   {noreply, State#cache{reaper_pid = NewReaperPid}};
 
 handle_info({'DOWN', _Ref, process, DatumPid, _Reason},
-    #cache{datum_index = DatumIndex, cache_used = Used} = State) ->
+    #cache{datum_index = DatumIndex} = State) ->
 
   %% Remove the _one_ pending 'new_datum_size' message, if it exists...
   receive {new_datum_size, {_UseKey, DatumPid, _Size}} -> noop
@@ -234,14 +245,7 @@ handle_info({'DOWN', _Ref, process, DatumPid, _Reason},
   end,
 
   %% There can only be 1 entry in an ets 'set' table, so don't scan full table.
-  New_State =
-        case ets:match_object(DatumIndex, {'_', DatumPid, '_'}, 1) of
-            '$end_of_table' -> State;
-            {[], _Cont_Fn}  -> State; 
-            {[{UseKey, DatumPid, Size}], _Cont_Fn} ->
-                ets:delete(DatumIndex, UseKey),
-                State#cache{cache_used = Used - Size}
-        end,
+  New_State = delete_one_ets_entry_by_pid(DatumIndex, DatumPid, State),
   {noreply, New_State};
 
 handle_info(_Info, State) ->
@@ -252,6 +256,15 @@ handle_info(_Info, State) ->
 %% ===================================================================
 %% Private
 %% ===================================================================
+
+delete_one_ets_entry_by_pid(DatumIndex, DatumPid, #cache{cache_used = Used} = State) ->
+    case ets:match_object(DatumIndex, {'_', DatumPid, '_'}, 1) of
+        '$end_of_table' -> State;
+        {[], _Cont_Fn}  -> State; 
+        {[{UseKey, DatumPid, Size}], _Cont_Fn} ->
+            ets:delete(DatumIndex, UseKey),
+            State#cache{cache_used = Used - Size}
+    end.
 
 get_age(DatumPid) ->
     Ref = make_ref(),
