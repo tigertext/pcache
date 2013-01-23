@@ -74,8 +74,24 @@ check_cache_size(Cache) ->
     Size3 = pcache:total_size(Cache),
     ?assert(Size3 > Size2),
 
+    %% Empty takes immediate effect...
     ?assertMatch(2, pcache:empty(Cache)),
+    ?assertMatch(0, pcache:total_size(Cache)),
+
+    %% And late messages don't make size negative.
+    pcache:get(Cache, "bob"),
     timer:sleep(10),
+    Size1 = pcache:total_size(Cache),
+    ?assert(Size1 > 0),
+    pcache:get(tc, "bob2"),
+    timer:sleep(10),
+    Size2 = pcache:total_size(Cache),
+    ?assert(Size2 > Size1),
+    pcache:dirty(Cache, "bob2"),
+    timer:sleep(10),
+    ?assertMatch(Size1, pcache:total_size(Cache)),
+
+    ?assertMatch(1, pcache:empty(Cache)),
     ?assertMatch(0, pcache:total_size(Cache)).
 
 crash_tester(Key) -> Key ++ " broke me".
@@ -196,6 +212,29 @@ check_spawn_speed(Cache) ->
                     || {datum, Key, Micros, Result} <- Results, Micros > 300],
     ?assertMatch([], Slow_Fetches),
     ?assertMatch([], [R || {datum, _Key, _Micros, R} <- Results, R =/= Existing_Result]).
+
+
+%%% =======================================================================
+%%% Test dirty followed immediately by get doesn't timeout
+%%% =======================================================================
+                                     
+pcache_timeout_test_() ->
+    {setup, fun pcache_setup/0, fun pcache_cleanup/1,
+     {with, [fun check_dirty_timeout/1]}
+     }.
+
+check_dirty_timeout(Cache) ->
+    Bob_Value = erlang:md5("bob"),
+    Bob2_Value = erlang:md5("bob2"),
+    ?assertMatch(Bob_Value,  pcache:get(Cache, "bob")),
+    ?assertMatch(Bob2_Value, pcache:get(Cache, "bob2")),
+    timer:sleep(10),
+    ?assertMatch([{cache_name, tc}, {datum_count, 2}], pcache:stats(tc)),
+
+    ?assertMatch(ok, pcache:dirty(Cache, "bob2")),
+    ?assertMatch(Bob2_Value, pcache:get(Cache, "bob2")),
+    ?assertMatch(Bob_Value, pcache:get(Cache, "bob")),
+    ok.
 
 
 %%% =======================================================================
