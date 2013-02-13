@@ -1,10 +1,11 @@
 -module(pcache_tests).
 -include_lib("eunit/include/eunit.hrl").
 
--export([tester/1, memoize_tester/1, slow_tester/1, lookup_tester/1, crash_tester/1]).
+-export([tester/1, memoize_tester/1, slow_tester/1, lookup_tester/1, crash_tester/1
+        ]).
 
 %% Spawned functions
--export([notify/3]).
+-export([notify/3, many_gets/2, many_pings/2]).
 
 
 %%% =======================================================================
@@ -241,7 +242,7 @@ check_dirty_timeout(Cache) ->
 %%% Test that TTL and reaper culls the oldest values
 %%% =======================================================================
 pcache_fast_ttl_setup() ->
-  %% start cache server tc (test cache), 6 MB cache, 2 second TTL per entry (300 seconds)
+  %% start cache server tc (test cache), 6 MB cache, 2 second TTL per entry
   {ok, Pid} = pcache_server:start_link(tc, ?MODULE, tester, 6, 2000),
   Pid.
 
@@ -326,4 +327,30 @@ check_rand(Cache) ->
     ?assertMatch(3, length([K || K <- Rand_Key_2, string:substr(K, 1, 4) == "fred"])),
     ?assertMatch(3, length(Rand_Key_2)),
     ?assert(Rand_Key_1 =/= Rand_Key_2).
+    
+
+%%% =======================================================================
+%%% Test get vs. last_active performance (cost of now())
+%%% =======================================================================
+
+pcache_speed_test_() ->
+  {setup, fun pcache_fast_ttl_setup/0, fun pcache_cleanup/1,
+    {with, [fun check_speed/1]}
+  }.
+
+check_speed(Cache) ->
+    V1 = pcache:get(Cache, "jim1"),
+    timer:sleep(1000),
+    V2 = pcache:age(Cache, "jim1"),
+    Repeat_Count = 50000,
+    {Time1, Result1} = timer:tc(?MODULE, many_gets,  [Cache, Repeat_Count]),
+    lists:all(fun(V) -> V =:= V1 end, Result1),
+    {Time2, Result2} = timer:tc(?MODULE, many_pings, [Cache, Repeat_Count]),
+    lists:all(fun(V) -> V =:= V2 end, Result2),
+    error_logger:info_msg("~p pcache:get requests takes ~p seconds~n", [Repeat_Count, Time1 / 1000000]),
+    error_logger:info_msg("~p pcache:age requests takes ~p seconds~n", [Repeat_Count, Time2 / 1000000]),
+    ok.
+
+many_gets(Cache, Count)  -> [pcache:get(Cache, "jim1") || _N <- lists:seq(1,Count)].
+many_pings(Cache, Count) -> [pcache:get(Cache, "jim1") || _N <- lists:seq(1,Count)].
     

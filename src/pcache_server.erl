@@ -89,7 +89,12 @@ key(M, F, A) -> {M, F, A}.
 %%% handle_call messages
 %%%----------------------------------------------------------------------
 
-%% Only to allow for testing of reap_oldest
+%% Only to allow for testing of reap_oldest and performance
+handle_call({age, Key}, _From, #cache{} = State) ->
+    Datum_Pid = locate(Key, State),
+    Age = get_age(Datum_Pid),
+    {reply, Age, State};
+
 handle_call(ages, _From, #cache{datum_index = DatumIndex} = State) ->
     All_Datums = ets:foldl(fun({_UseKey, DatumPid, _Size}, Pids) -> [DatumPid | Pids] end, [], DatumIndex),
     Ages = [get_age(Pid) || Pid <- All_Datums],
