@@ -38,7 +38,8 @@ check_get_and_dirty(_Cache) ->
     ?assertMatch(Bob_Value,  pcache:get(tc, "bob")),
     ?assertMatch(Bob2_Value, pcache:get(tc, "bob2")),
     timer:sleep(10),
-    ?assertMatch([{cache_name, tc}, {datum_count, 2}], pcache:stats(tc)),
+    Stats1 = pcache:stats(tc),
+    ?assertMatch([tc, 2], [proplists:get_value(P, Stats1) || P <- [cache_name, datum_count]]),
 
     ?assertMatch(ok, pcache:dirty(tc, "bob2")),
     ?assertMatch(ok, pcache:dirty(tc, "bob2")),
@@ -47,7 +48,8 @@ check_get_and_dirty(_Cache) ->
     ?assertMatch(ok, pcache:dirty_memoize(tc, ?MODULE, memoize_tester, "bob2")),
     timer:sleep(10),
 
-    ?assertMatch([{cache_name, tc}, {datum_count, 1}], pcache:stats(tc)),
+    Stats2 = pcache:stats(tc),
+    ?assertMatch([tc, 1], [proplists:get_value(P, Stats2) || P <- [cache_name, datum_count]]),
     ?assertMatch(1, pcache:empty(tc)).
 
 check_cache_size(Cache) ->
@@ -55,45 +57,55 @@ check_cache_size(Cache) ->
     pcache:get(Cache, "bob"),
     timer:sleep(10),
     Size1 = pcache:total_size(Cache),
-    ?assert(Size1 > 0),
+    ?assert(is_integer(Size1) andalso Size1 > 0),
+    ?assertMatch(Size1, proplists:get_value(memory_used, pcache:stats(Cache))),
     pcache:get(tc, "bob2"),
     timer:sleep(10),
     Size2 = pcache:total_size(Cache),
-    ?assert(Size2 > Size1),
+    ?assert(is_integer(Size2) andalso Size2 > Size1),
+    ?assertMatch(Size2, proplists:get_value(memory_used, pcache:stats(Cache))),
     pcache:dirty(Cache, "bob2"),
     timer:sleep(10),
     ?assertMatch(Size1, pcache:total_size(Cache)),
+    ?assertMatch(Size1, proplists:get_value(memory_used, pcache:stats(Cache))),
 
     Bob2 = pcache:get(Cache, "bob2"),
     timer:sleep(10),
     ?assertMatch(Size2, pcache:total_size(Cache)),
+    ?assertMatch(Size2, proplists:get_value(memory_used, pcache:stats(Cache))),
     ?assertMatch(Bob2, erlang:md5("bob2")),
     Long_Value = lists:duplicate(3,"supercalifragilisticexpialidocious"),
     pcache:dirty(Cache, "bob2", Long_Value),
     timer:sleep(10),
     ?assertMatch(Long_Value, pcache:get(Cache, "bob2")),
     Size3 = pcache:total_size(Cache),
-    ?assert(Size3 > Size2),
+    ?assert(is_integer(Size3) andalso Size3 > Size2),
+    ?assertMatch(Size3, proplists:get_value(memory_used, pcache:stats(Cache))),
 
     %% Empty takes immediate effect...
     ?assertMatch(2, pcache:empty(Cache)),
     ?assertMatch(0, pcache:total_size(Cache)),
+    ?assertMatch(0, proplists:get_value(memory_used, pcache:stats(Cache))),
 
     %% And late messages don't make size negative.
     pcache:get(Cache, "bob"),
     timer:sleep(10),
     Size1 = pcache:total_size(Cache),
-    ?assert(Size1 > 0),
+    ?assert(is_integer(Size1) andalso Size1 > 0),
+    ?assertMatch(Size1, proplists:get_value(memory_used, pcache:stats(Cache))),
     pcache:get(tc, "bob2"),
     timer:sleep(10),
     Size2 = pcache:total_size(Cache),
-    ?assert(Size2 > Size1),
+    ?assert(is_integer(Size2) andalso Size2 > Size1),
+    ?assertMatch(Size2, proplists:get_value(memory_used, pcache:stats(Cache))),
     pcache:dirty(Cache, "bob2"),
     timer:sleep(10),
     ?assertMatch(Size1, pcache:total_size(Cache)),
+    ?assertMatch(Size1, proplists:get_value(memory_used, pcache:stats(Cache))),
 
     ?assertMatch(1, pcache:empty(Cache)),
-    ?assertMatch(0, pcache:total_size(Cache)).
+    ?assertMatch(0, pcache:total_size(Cache)),
+    ?assertMatch(0, proplists:get_value(memory_used, pcache:stats(Cache))).
 
 crash_tester(Key) -> Key ++ " broke me".
 
@@ -230,7 +242,8 @@ check_dirty_timeout(Cache) ->
     ?assertMatch(Bob_Value,  pcache:get(Cache, "bob")),
     ?assertMatch(Bob2_Value, pcache:get(Cache, "bob2")),
     timer:sleep(10),
-    ?assertMatch([{cache_name, tc}, {datum_count, 2}], pcache:stats(tc)),
+    Stats = pcache:stats(tc),
+    ?assertMatch([tc, 2], [proplists:get_value(P, Stats) || P <- [cache_name, datum_count]]),
 
     ?assertMatch(ok, pcache:dirty(Cache, "bob2")),
     ?assertMatch(Bob2_Value, pcache:get(Cache, "bob2")),

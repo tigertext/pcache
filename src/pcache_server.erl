@@ -119,11 +119,11 @@ handle_call({get, Key}, From, #cache{} = State) ->
 handle_call(total_size, _From, #cache{cache_used = Used} = State) ->
   {reply, Used, State};
 
-handle_call(stats, _From, #cache{datum_index = DatumIndex} = State) ->
+handle_call(stats, _From, #cache{datum_index = DatumIndex, cache_used = Used, cache_size = Size} = State) ->
   EtsInfo = ets:info(DatumIndex),
   CacheName = proplists:get_value(name, EtsInfo),
   DatumCount = proplists:get_value(size, EtsInfo),
-  Stats = [{cache_name, CacheName}, {datum_count, DatumCount}],
+  Stats = [{cache_name, CacheName}, {datum_count, DatumCount}, {memory_used, Used}, {memory_allocated, Size}],
   {reply, Stats, State};
 
 handle_call(empty, _From, #cache{datum_index = DatumIndex} = State) ->
