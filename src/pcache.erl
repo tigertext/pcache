@@ -1,7 +1,7 @@
 -module(pcache).
 -compile(export_all).
 
--export([get/2, get/3,
+-export([get/2, get/3, age/2,
          empty/1, total_size/1, stats/1,
          dirty/2, dirty/3, 
          rand/2, rand_keys/2]).
@@ -33,6 +33,9 @@ get(ServerName, Key) ->
 
 get(ServerName, Key, Timeout) ->
   gen_server:call(ServerName, {get, Key}, Timeout).
+
+age(ServerName, Key) ->
+  gen_server:call(ServerName, {age, Key}, ?FAST_TIMEOUT).
 
 memoize(MemoizeCacheServer, Module, Fun, Key) ->
   gen_server:call(MemoizeCacheServer, {generic_get, Module, Fun, Key}).

@@ -89,7 +89,12 @@ key(M, F, A) -> {M, F, A}.
 %%% handle_call messages
 %%%----------------------------------------------------------------------
 
-%% Only to allow for testing of reap_oldest
+%% Only to allow for testing of reap_oldest and performance
+handle_call({age, Key}, _From, #cache{} = State) ->
+    Datum_Pid = locate(Key, State),
+    Age = get_age(Datum_Pid),
+    {reply, Age, State};
+
 handle_call(ages, _From, #cache{datum_index = DatumIndex} = State) ->
     All_Datums = ets:foldl(fun({_UseKey, DatumPid, _Size}, Pids) -> [DatumPid | Pids] end, [], DatumIndex),
     Ages = [get_age(Pid) || Pid <- All_Datums],
@@ -114,11 +119,11 @@ handle_call({get, Key}, From, #cache{} = State) ->
 handle_call(total_size, _From, #cache{cache_used = Used} = State) ->
   {reply, Used, State};
 
-handle_call(stats, _From, #cache{datum_index = DatumIndex} = State) ->
+handle_call(stats, _From, #cache{datum_index = DatumIndex, cache_used = Used, cache_size = Size} = State) ->
   EtsInfo = ets:info(DatumIndex),
   CacheName = proplists:get_value(name, EtsInfo),
   DatumCount = proplists:get_value(size, EtsInfo),
-  Stats = [{cache_name, CacheName}, {datum_count, DatumCount}],
+  Stats = [{cache_name, CacheName}, {datum_count, DatumCount}, {memory_used, Used}, {memory_allocated, Size}],
   {reply, Stats, State};
 
 handle_call(empty, _From, #cache{datum_index = DatumIndex} = State) ->
