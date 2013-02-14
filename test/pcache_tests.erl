@@ -1,10 +1,11 @@
 -module(pcache_tests).
 -include_lib("eunit/include/eunit.hrl").
 
--export([tester/1, memoize_tester/1, slow_tester/1, lookup_tester/1, crash_tester/1]).
+-export([tester/1, memoize_tester/1, slow_tester/1, lookup_tester/1, crash_tester/1
+        ]).
 
 %% Spawned functions
--export([notify/3]).
+-export([notify/3, many_gets/2, many_pings/2]).
 
 
 %%% =======================================================================
@@ -37,7 +38,8 @@ check_get_and_dirty(_Cache) ->
     ?assertMatch(Bob_Value,  pcache:get(tc, "bob")),
     ?assertMatch(Bob2_Value, pcache:get(tc, "bob2")),
     timer:sleep(10),
-    ?assertMatch([{cache_name, tc}, {datum_count, 2}], pcache:stats(tc)),
+    Stats1 = pcache:stats(tc),
+    ?assertMatch([tc, 2], [proplists:get_value(P, Stats1) || P <- [cache_name, datum_count]]),
 
     ?assertMatch(ok, pcache:dirty(tc, "bob2")),
     ?assertMatch(ok, pcache:dirty(tc, "bob2")),
@@ -46,7 +48,8 @@ check_get_and_dirty(_Cache) ->
     ?assertMatch(ok, pcache:dirty_memoize(tc, ?MODULE, memoize_tester, "bob2")),
     timer:sleep(10),
 
-    ?assertMatch([{cache_name, tc}, {datum_count, 1}], pcache:stats(tc)),
+    Stats2 = pcache:stats(tc),
+    ?assertMatch([tc, 1], [proplists:get_value(P, Stats2) || P <- [cache_name, datum_count]]),
     ?assertMatch(1, pcache:empty(tc)).
 
 check_cache_size(Cache) ->
@@ -54,45 +57,55 @@ check_cache_size(Cache) ->
     pcache:get(Cache, "bob"),
     timer:sleep(10),
     Size1 = pcache:total_size(Cache),
-    ?assert(Size1 > 0),
+    ?assert(is_integer(Size1) andalso Size1 > 0),
+    ?assertMatch(Size1, proplists:get_value(memory_used, pcache:stats(Cache))),
     pcache:get(tc, "bob2"),
     timer:sleep(10),
     Size2 = pcache:total_size(Cache),
-    ?assert(Size2 > Size1),
+    ?assert(is_integer(Size2) andalso Size2 > Size1),
+    ?assertMatch(Size2, proplists:get_value(memory_used, pcache:stats(Cache))),
     pcache:dirty(Cache, "bob2"),
     timer:sleep(10),
     ?assertMatch(Size1, pcache:total_size(Cache)),
+    ?assertMatch(Size1, proplists:get_value(memory_used, pcache:stats(Cache))),
 
     Bob2 = pcache:get(Cache, "bob2"),
     timer:sleep(10),
     ?assertMatch(Size2, pcache:total_size(Cache)),
+    ?assertMatch(Size2, proplists:get_value(memory_used, pcache:stats(Cache))),
     ?assertMatch(Bob2, erlang:md5("bob2")),
     Long_Value = lists:duplicate(3,"supercalifragilisticexpialidocious"),
     pcache:dirty(Cache, "bob2", Long_Value),
     timer:sleep(10),
     ?assertMatch(Long_Value, pcache:get(Cache, "bob2")),
     Size3 = pcache:total_size(Cache),
-    ?assert(Size3 > Size2),
+    ?assert(is_integer(Size3) andalso Size3 > Size2),
+    ?assertMatch(Size3, proplists:get_value(memory_used, pcache:stats(Cache))),
 
     %% Empty takes immediate effect...
     ?assertMatch(2, pcache:empty(Cache)),
     ?assertMatch(0, pcache:total_size(Cache)),
+    ?assertMatch(0, proplists:get_value(memory_used, pcache:stats(Cache))),
 
     %% And late messages don't make size negative.
     pcache:get(Cache, "bob"),
     timer:sleep(10),
     Size1 = pcache:total_size(Cache),
-    ?assert(Size1 > 0),
+    ?assert(is_integer(Size1) andalso Size1 > 0),
+    ?assertMatch(Size1, proplists:get_value(memory_used, pcache:stats(Cache))),
     pcache:get(tc, "bob2"),
     timer:sleep(10),
     Size2 = pcache:total_size(Cache),
-    ?assert(Size2 > Size1),
+    ?assert(is_integer(Size2) andalso Size2 > Size1),
+    ?assertMatch(Size2, proplists:get_value(memory_used, pcache:stats(Cache))),
     pcache:dirty(Cache, "bob2"),
     timer:sleep(10),
     ?assertMatch(Size1, pcache:total_size(Cache)),
+    ?assertMatch(Size1, proplists:get_value(memory_used, pcache:stats(Cache))),
 
     ?assertMatch(1, pcache:empty(Cache)),
-    ?assertMatch(0, pcache:total_size(Cache)).
+    ?assertMatch(0, pcache:total_size(Cache)),
+    ?assertMatch(0, proplists:get_value(memory_used, pcache:stats(Cache))).
 
 crash_tester(Key) -> Key ++ " broke me".
 
@@ -229,7 +242,8 @@ check_dirty_timeout(Cache) ->
     ?assertMatch(Bob_Value,  pcache:get(Cache, "bob")),
     ?assertMatch(Bob2_Value, pcache:get(Cache, "bob2")),
     timer:sleep(10),
-    ?assertMatch([{cache_name, tc}, {datum_count, 2}], pcache:stats(tc)),
+    Stats = pcache:stats(tc),
+    ?assertMatch([tc, 2], [proplists:get_value(P, Stats) || P <- [cache_name, datum_count]]),
 
     ?assertMatch(ok, pcache:dirty(Cache, "bob2")),
     ?assertMatch(Bob2_Value, pcache:get(Cache, "bob2")),
@@ -241,7 +255,7 @@ check_dirty_timeout(Cache) ->
 %%% Test that TTL and reaper culls the oldest values
 %%% =======================================================================
 pcache_fast_ttl_setup() ->
-  %% start cache server tc (test cache), 6 MB cache, 2 second TTL per entry (300 seconds)
+  %% start cache server tc (test cache), 6 MB cache, 2 second TTL per entry
   {ok, Pid} = pcache_server:start_link(tc, ?MODULE, tester, 6, 2000),
   Pid.
 
@@ -326,4 +340,30 @@ check_rand(Cache) ->
     ?assertMatch(3, length([K || K <- Rand_Key_2, string:substr(K, 1, 4) == "fred"])),
     ?assertMatch(3, length(Rand_Key_2)),
     ?assert(Rand_Key_1 =/= Rand_Key_2).
+    
+
+%%% =======================================================================
+%%% Test get vs. last_active performance (cost of now())
+%%% =======================================================================
+
+pcache_speed_test_() ->
+  {setup, fun pcache_fast_ttl_setup/0, fun pcache_cleanup/1,
+    {with, [fun check_speed/1]}
+  }.
+
+check_speed(Cache) ->
+    V1 = pcache:get(Cache, "jim1"),
+    timer:sleep(1000),
+    V2 = pcache:age(Cache, "jim1"),
+    Repeat_Count = 50000,
+    {Time1, Result1} = timer:tc(?MODULE, many_gets,  [Cache, Repeat_Count]),
+    lists:all(fun(V) -> V =:= V1 end, Result1),
+    {Time2, Result2} = timer:tc(?MODULE, many_pings, [Cache, Repeat_Count]),
+    lists:all(fun(V) -> V =:= V2 end, Result2),
+    error_logger:info_msg("~p pcache:get requests takes ~p seconds~n", [Repeat_Count, Time1 / 1000000]),
+    error_logger:info_msg("~p pcache:age requests takes ~p seconds~n", [Repeat_Count, Time2 / 1000000]),
+    ok.
+
+many_gets(Cache, Count)  -> [pcache:get(Cache, "jim1") || _N <- lists:seq(1,Count)].
+many_pings(Cache, Count) -> [pcache:get(Cache, "jim1") || _N <- lists:seq(1,Count)].
     
