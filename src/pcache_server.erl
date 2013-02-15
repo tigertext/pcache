@@ -100,6 +100,9 @@ handle_call(ages, _From, #cache{datum_index = DatumIndex} = State) ->
     Ages = [get_age(Pid) || Pid <- All_Datums],
     {reply, Ages, State};
 
+handle_call({change_default_ttl, New_TTL}, _From, #cache{default_ttl = Old_TTL} = State) ->
+    {reply, Old_TTL, State#cache{default_ttl = New_TTL}};
+
 handle_call({location, DatumKey}, _From, State) -> 
   {reply, locate(DatumKey, State), State};
 
@@ -119,11 +122,16 @@ handle_call({get, Key}, From, #cache{} = State) ->
 handle_call(total_size, _From, #cache{cache_used = Used} = State) ->
   {reply, Used, State};
 
-handle_call(stats, _From, #cache{datum_index = DatumIndex, cache_used = Used, cache_size = Size} = State) ->
+handle_call(stats, _From, #cache{datum_index = DatumIndex, cache_used = Used, cache_size = Size,
+                                 default_ttl = DefaultTTL} = State) ->
   EtsInfo = ets:info(DatumIndex),
   CacheName = proplists:get_value(name, EtsInfo),
   DatumCount = proplists:get_value(size, EtsInfo),
-  Stats = [{cache_name, CacheName}, {datum_count, DatumCount}, {memory_used, Used}, {memory_allocated, Size}],
+  Stats = [
+           {cache_name, CacheName}, {datum_count, DatumCount},
+           {memory_used, Used}, {memory_allocated, Size},
+           {default_ttl, DefaultTTL}
+          ],
   {reply, Stats, State};
 
 handle_call(empty, _From, #cache{datum_index = DatumIndex} = State) ->
