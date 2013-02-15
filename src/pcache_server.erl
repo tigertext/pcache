@@ -219,7 +219,13 @@ handle_cast({generic_dirty, M, F, A},
             DatumPid ! {destroy, Ref, self()},
             ets:delete(DatumIndex, UseKey),
             {noreply, State#cache{cache_used = Used - Size}}
-    end.
+    end;
+
+handle_cast({expire, Pct_TTL_Remaining}, #cache{datum_index = DatumIndex} = State) ->
+    Ref = make_ref(),
+    Notify_All_Fn = fun({_UseKey, DatumPid, _Size}, N) -> DatumPid ! {{expire, Pct_TTL_Remaining}, Ref, Ref}, N+1 end,
+    ets:foldl(Notify_All_Fn, 0, DatumIndex),
+    {noreply, State}.
 
 
 %%%----------------------------------------------------------------------
@@ -436,6 +442,20 @@ datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
       From ! {destroy, Ref, self(), ok},
       % io:format("destroying ~p with last access of ~p~n", [self(), LastActive]),
       exit(self(), destroy);
+
+    %% Request to expire if less than Pct_TTL_Remaining...
+    {{expire, Pct_TTL_Remaining}, _Ref, _From}
+        when is_integer(Pct_TTL_Remaining), Pct_TTL_Remaining > 0, Pct_TTL_Remaining < 100 ->
+          Now = calendar:time_to_seconds(now()),
+          Time_Buffer = (Pct_TTL_Remaining * TTL / 100),
+          Remaining_TTL = case State#datum.type of
+                              actual_time -> ((Now - State#datum.started) * 1000) - Time_Buffer;
+                              _Other      -> ((Now - LastActive)          * 1000) - Time_Buffer
+                          end,
+          case Remaining_TTL of
+              Expired when Expired =< 0 -> cache_is_now_dead;
+              _Not_Expired -> continue_noreset(State)
+          end;
 
     %% Presumably bad code elsewhere, but intent is for datum to be activated...
     {InvalidRequest, Ref, From} ->

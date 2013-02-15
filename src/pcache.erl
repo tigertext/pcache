@@ -37,6 +37,10 @@ get(ServerName, Key, Timeout) ->
 age(ServerName, Key) ->
   gen_server:call(ServerName, {age, Key}, ?FAST_TIMEOUT).
 
+expire(ServerName, Pct_TTL_Remaining)
+  when is_integer(Pct_TTL_Remaining), Pct_TTL_Remaining > 0, Pct_TTL_Remaining < 100 ->
+    gen_server:cast(ServerName, {expire, Pct_TTL_Remaining}).
+
 memoize(MemoizeCacheServer, Module, Fun, Key) ->
   gen_server:call(MemoizeCacheServer, {generic_get, Module, Fun, Key}).
 
