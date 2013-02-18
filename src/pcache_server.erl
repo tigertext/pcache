@@ -9,7 +9,7 @@
 %% Spawned functions
 -export([datum_launch/7, datum_loop/1]).
 
--type cache_policy() :: mru | actual_time.
+-type cache_policy() :: lru | actual_time.
 
 -record(cache, {
           name             :: atom(),
@@ -31,12 +31,12 @@ start_link(Name, Mod, Fun) ->
 start_link(Name, Mod, Fun, CacheSize) ->
   start_link(Name, Mod, Fun, CacheSize, 300000).
 
-% make MRU policy cache
+% make LRU policy cache
 start_link(Name, Mod, Fun, CacheSize, CacheTime) ->
-  start_link(Name, Mod, Fun, CacheSize, CacheTime, mru).
+  start_link(Name, Mod, Fun, CacheSize, CacheTime, lru).
 
 start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy)
-  when CachePolicy =:= mru; CachePolicy =:= actual_time ->
+  when CachePolicy =:= lru; CachePolicy =:= actual_time ->
     Args = [Name, Mod, Fun, CacheSize, CacheTime, CachePolicy],
     gen_server:start_link({local, Name}, ?MODULE, Args, []).
 
@@ -53,14 +53,14 @@ init([Name, Mod, Fun, CacheSize, CacheTime, CachePolicy]) ->
   erlang:monitor(process, ReaperPid),
 
   State = #cache{name = Name,
-                 datum_index = DatumIndex,
-                 data_module = Mod,
+                 datum_index   = DatumIndex,
+                 data_module   = Mod,
                  data_accessor = Fun,
-                 reaper_pid = ReaperPid,
-                 default_ttl = CacheTime,
-                 cache_policy = CachePolicy,
-                 cache_size = CacheSizeBytes,
-                 cache_used = 0},
+                 reaper_pid    = ReaperPid,
+                 default_ttl   = CacheTime,
+                 cache_policy  = CachePolicy,
+                 cache_size    = CacheSizeBytes,
+                 cache_used    = 0},
   {ok, State}.
 
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
@@ -124,12 +124,12 @@ handle_call(total_size, _From, #cache{cache_used = Used} = State) ->
 
 handle_call(stats, _From, #cache{datum_index = DatumIndex, cache_used = Used, cache_size = Size,
                                  default_ttl = DefaultTTL} = State) ->
-  EtsInfo = ets:info(DatumIndex),
-  CacheName = proplists:get_value(name, EtsInfo),
+  EtsInfo    = ets:info(DatumIndex),
+  CacheName  = proplists:get_value(name, EtsInfo),
   DatumCount = proplists:get_value(size, EtsInfo),
   Stats = [
-           {cache_name, CacheName}, {datum_count, DatumCount},
-           {memory_used, Used}, {memory_allocated, Size},
+           {cache_name,  CacheName}, {datum_count, DatumCount},
+           {memory_used, Used},      {memory_allocated, Size},
            {default_ttl, DefaultTTL}
           ],
   {reply, Stats, State};
@@ -156,7 +156,7 @@ handle_call(reap_oldest, _From, #cache{datum_index = DatumIndex} = State) ->
     Datum_Count = ets:foldl(Request_Timestamp_Fn, 0, DatumIndex),
 
     %% Then filter the results coming back for the oldest one and destroy it.
-    NewState = case filter_oldest(Ref, Datum_Count, calendar:time_to_seconds(now()), false) of
+    NewState = case filter_oldest(Ref, Datum_Count, erlang:now(), false) of
                    false -> State;
                    Oldest_Pid ->
                        Oldest_Pid ! {destroy, Ref, self()},
@@ -289,7 +289,7 @@ get_age(DatumPid) ->
     Ref = make_ref(),
     DatumPid ! {last_active, Ref, self()},
     receive {last_active, Ref, DatumPid, Last_Active} -> {Last_Active, DatumPid}
-    after 20 -> no_response
+    after 50 -> no_response
     end.
     
 filter_oldest(_Ref, 0, _Oldest_Active, Oldest_Pid) -> Oldest_Pid;
@@ -300,7 +300,7 @@ filter_oldest( Ref, N,  Oldest_Active, Oldest_Pid) ->
                 true  -> filter_oldest(Ref, N-1, Last_Active,   DatumPid);
                 false -> filter_oldest(Ref, N-1, Oldest_Active, Oldest_Pid)
             end
-    after 50 -> Oldest_Pid
+    after 30 -> Oldest_Pid
     end.
 
 get_data(DatumPid) -> get_data(DatumPid, 100).
@@ -320,19 +320,18 @@ get_key(DatumPid, Timeout) ->
   end.
 
 -record(datum, {
-          key            :: any(),
-          mgr            :: pid(),
-          data           :: any(),
-          started        :: pos_integer(),
-          last_active    :: pos_integer(),
-          ttl            :: pos_integer(),
-          type           :: cache_policy(),
-          remaining_ttl  :: non_neg_integer()
+          key                          :: any(),
+          mgr                          :: pid(),
+          data                         :: any(),
+          type          = lru          :: cache_policy(),
+          started       = erlang:now() :: erlang:timestamp(),
+          last_active   = erlang:now() :: erlang:timestamp(),
+          ttl           = 0            :: pos_integer(),       %% Number of milliseconds
+          remaining_ttl = 0            :: non_neg_integer()    %% Number of milliseconds
          }).
 
 create_datum(Cache_Server, Key, Data, TTL, Type) ->
-  #datum{key = Key, mgr = Cache_Server, data = Data, ttl = TTL,
-         remaining_ttl = TTL, type = Type, started = calendar:time_to_seconds(now())}.
+    #datum{key = Key, mgr = Cache_Server, data = Data, type = Type, ttl = TTL, remaining_ttl = TTL}.
 
 make_new_datum(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy) ->
     try
@@ -359,53 +358,45 @@ launch_memoize_datum(DatumKey, UseKey, EtsIndex, Module, Accessor, TTL, CachePol
 
 datum_launch(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy) ->
     Datum = make_new_datum(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy),
-    Datum_Pid = self(),
-    garbage_collect(),
-    {memory, Size} = process_info(Datum_Pid, memory),
-    Cache_Server ! {new_datum_size, {UseKey, Datum_Pid, Size}},
-    datum_loop(Datum).
+    datum_size_notify(Cache_Server, Datum).
 
 
 %%% =======================================================================
 %%% Datum pid internal state management and main receive loop
 %%% =======================================================================
 
+%% Expire on next loop if TTL has passed since process started when using 'actual_time'.
 update_ttl(#datum{started = Started, ttl = TTL, type = actual_time} = Datum) ->
-
-    %% Get total time in seconds this datum has been running.  Convert to ms.
-    Now = calendar:time_to_seconds(now()),
-    Started_Now_Diff = (Now - Started) * 1000,
-
-    %% If we are less than the TTL, update with TTL-used (TTL in ms too)
-    %% else, we ran out of time.  expire on next loop.
-    TTL_Remaining = case TTL - Started_Now_Diff of
+    Now = erlang:now(),
+    Elapsed = timer:now_diff(Now, Started) div 1000,
+    TTL_Remaining = case TTL - Elapsed of
                         Remainder when Remainder > 0 -> Remainder;
                         _ -> 0
                     end,
     Datum#datum{last_active = Now, remaining_ttl = TTL_Remaining};
 
+%% Expire after TTL of idle time on all other cache strategies.
 update_ttl(#datum{} = Datum) ->
-    Datum#datum{last_active = calendar:time_to_seconds(now())}.
+    Datum#datum{last_active = erlang:now()}.
+
 
 update_data(#datum{} = Datum, NewData) ->
   Datum#datum{data = NewData}.
     
-continue(#datum{} = Datum) ->
-  datum_loop(update_ttl(Datum)).
-
-continue_noreset(#datum{} = Datum) ->
-  datum_loop(Datum).
+continue        (#datum{} = Datum) -> datum_loop(update_ttl(Datum)).
+continue_noreset(#datum{} = Datum) -> datum_loop(Datum).
 
 %% Give process a chance to discard old #datum{} before notifying.
 datum_size_notify(Mgr, #datum{key = Key} = Datum) ->
+    Datum_Pid = self(),
     garbage_collect(),
-    {memory, Size} = process_info(self(), memory),
-    Mgr ! {new_datum_size, {Key, self(), Size}},
+    {memory, Size} = process_info(Datum_Pid, memory),
+    Mgr ! {new_datum_size, {Key, Datum_Pid, Size}},
     datum_loop(Datum).
 
 %% Main loop for datum replies and updates.    
 datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
-            data = Data, remaining_ttl = TTL} = State) ->
+                  data = Data, remaining_ttl = TTL} = State) ->
   receive
     {new_data, _Ref, Mgr, Replacement} ->
       New_Datum = update_data(State, Replacement),
@@ -454,12 +445,14 @@ datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
     %% Request to expire if less than Pct_TTL_Remaining...
     {{expire, Pct_TTL_Remaining}, _Ref, _From}
         when is_integer(Pct_TTL_Remaining), Pct_TTL_Remaining > 0, Pct_TTL_Remaining < 100 ->
-          Now = calendar:time_to_seconds(now()),
-          Time_Buffer = (Pct_TTL_Remaining * TTL / 100),
+          Now = erlang:now(),
+          Time_Buffer = (Pct_TTL_Remaining * TTL div 100),
+          Elapsed = timer:now_diff(Now, State#datum.started) div 1000,
           Remaining_TTL = case State#datum.type of
-                              actual_time -> ((Now - State#datum.started) * 1000) - Time_Buffer;
-                              _Other      -> ((Now - LastActive)          * 1000) - Time_Buffer
+                              actual_time -> Elapsed - Time_Buffer;
+                              _Other      -> TTL - Elapsed - Time_Buffer
                           end,
+          %% error_logger:info_msg("Expire: ~p (~p vs ~p)~n", [Key, Remaining_TTL, Time_Buffer]),
           case Remaining_TTL of
               Expired when Expired =< 0 -> cache_is_now_dead;
               _Not_Expired -> continue_noreset(State)
