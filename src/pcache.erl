@@ -1,7 +1,7 @@
 -module(pcache).
 -compile(export_all).
 
--export([get/2, get/3, age/2,
+-export([change_default_ttl/2, get/2, get/3, age/2,
          empty/1, total_size/1, stats/1,
          dirty/2, dirty/3, 
          rand/2, rand_keys/2]).
@@ -28,6 +28,9 @@ cache_ttl_sup(Name, Mod, Fun, Size, TTL) ->
 
 -define(FAST_TIMEOUT, 500).
 
+change_default_ttl(ServerName, New_TTL) ->
+  gen_server:call(ServerName, {change_default_ttl, New_TTL}).
+    
 get(ServerName, Key) ->
   gen_server:call(ServerName, {get, Key}, ?FAST_TIMEOUT).
 
@@ -36,6 +39,10 @@ get(ServerName, Key, Timeout) ->
 
 age(ServerName, Key) ->
   gen_server:call(ServerName, {age, Key}, ?FAST_TIMEOUT).
+
+expire(ServerName, Pct_TTL_Remaining)
+  when is_integer(Pct_TTL_Remaining), Pct_TTL_Remaining > 0, Pct_TTL_Remaining < 100 ->
+    gen_server:cast(ServerName, {expire, Pct_TTL_Remaining}).
 
 memoize(MemoizeCacheServer, Module, Fun, Key) ->
   gen_server:call(MemoizeCacheServer, {generic_get, Module, Fun, Key}).

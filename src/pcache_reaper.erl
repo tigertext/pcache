@@ -24,36 +24,28 @@ start(CacheName, CacheSize) ->
 %%% Callback functions from gen_server
 %%%----------------------------------------------------------------------
 
-shrink_cache_to_size(_Name, CurrentCacheSize, CacheSize) 
-  when CurrentCacheSize < CacheSize ->
-  ok;
-shrink_cache_to_size(Name, _CurrentCacheSize, CacheSize) ->
-  gen_server:call(Name, reap_oldest),
-  shrink_cache_to_size(Name, pcache:total_size(Name), CacheSize).
-   
+-define(DEFAULT_PCT_TTL,           20).
+-define(DEFAULT_CHECK_FREQUENCY, 4000).
 
-pcache_reaper(Name, CacheSize) ->
-  % sleep for 4 seconds
-  receive
-    after 4000 -> ok
-  end,
-  % Lame.  Account for sizes better.  total_size asks every datum for its size.
-  CurrentCacheSize = pcache:total_size(Name),
-  if
-    CurrentCacheSize < CacheSize -> ok;
-    CurrentCacheSize >= CacheSize ->
-%io:format("Cache ~p too big!  Shrinking...~n", [self()]),
-%io:format("CurrentSize: ~p; Target Size: ~p~n", [CurrentCacheSize, CacheSize]),
-      shrink_cache_to_size(Name, CurrentCacheSize, CacheSize)
-  end,
-  pcache_reaper(Name, CacheSize).
+pcache_reaper(Name, Cache_Size) ->
+    pcache_reaper(Name, Cache_Size, ?DEFAULT_CHECK_FREQUENCY).
+
+pcache_reaper(Name, Cache_Size, Check_Frequency) ->
+    case receive after Check_Frequency -> pcache:total_size(Name) end of
+        Current_Size when Current_Size < Cache_Size -> ok;
+        _Current_Size ->
+            %% io:format("Cache ~p too big!  Shrinking...~n", [self()]),
+            %% io:format("CurrentSize: ~p; Target Size: ~p~n", [_Current_Size, Cache_Size]),
+            pcache:expire(Name, ?DEFAULT_PCT_TTL)
+    end,
+    pcache_reaper(Name, Cache_Size, Check_Frequency).
     
 init([Name, CacheSizeBytes]) ->
   % pcache_reaper is started from pcache_server, but pcache_server can't finish
   % init'ing % until pcache_reaper:init/1 returns.
   % Use apply_after to make sure pcache_server exists when making calls.
   % Don't be clever and take this timer away.  Compensates for chicken/egg prob.
-  timer:apply_after(4000, ?MODULE, pcache_reaper, [Name, CacheSizeBytes]),
+  timer:apply_after(?DEFAULT_CHECK_FREQUENCY, ?MODULE, pcache_reaper, [Name, CacheSizeBytes]),
   State = #reaper{cache_size = CacheSizeBytes},
   {ok, State}.
 
