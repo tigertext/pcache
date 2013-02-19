@@ -261,8 +261,14 @@ pcache_fast_ttl_setup() ->
 
 pcache_ttl_test_() ->
   {setup, fun pcache_fast_ttl_setup/0, fun pcache_cleanup/1,
-    {with, [fun check_ttl/1]}
+    {with, [fun check_default_ttl/1, fun check_ttl/1]}
   }.
+
+check_default_ttl(Cache) ->
+    ?assertMatch(2000, proplists:get_value(default_ttl, pcache:stats(Cache))),
+    ?assertMatch(2000, pcache:change_default_ttl(Cache, 3000)),
+    ?assertMatch(3000, proplists:get_value(default_ttl, pcache:stats(Cache))),
+    ?assertMatch(3000, pcache:change_default_ttl(Cache, 2000)).
 
 check_ttl(Cache) ->
     pcache:get(Cache, "jim1"),
@@ -274,7 +280,7 @@ check_ttl(Cache) ->
     ?assertMatch(1, proplists:get_value(datum_count, pcache:stats(Cache))),
     timer:sleep(1000),
     ?assertMatch(0, proplists:get_value(datum_count, pcache:stats(Cache))).
-    
+
 pcache_oldest_test_() ->
   {setup, fun pcache_setup/0, fun pcache_cleanup/1,
     {with, [fun check_reap_oldest/1]}
@@ -290,9 +296,31 @@ check_reap_oldest(Cache) ->
     ?assertMatch(3, proplists:get_value(datum_count, pcache:stats(Cache))),
     Ages1 = lists:sort(gen_server:call(Cache, ages)),
     gen_server:call(Cache, reap_oldest),
+    timer:sleep(1000),
     Ages2 = lists:sort(gen_server:call(Cache, ages)),
     ?assertMatch(Ages2, tl(Ages1)).
 
+pcache_lemmings_test_() ->
+  {setup, fun pcache_fast_ttl_setup/0, fun pcache_cleanup/1,
+    {with, [fun check_mass_expire/1]}
+  }.
+
+make_jims(Cache, Start, End) ->
+    [pcache:get(Cache, Key)
+     || Key <- ["jim" ++ integer_to_list(N) || N <- lists:seq(Start, End)]].
+    
+check_mass_expire(Cache) ->
+    make_jims(Cache, 1, 20),
+    timer:sleep(800),
+    make_jims(Cache, 21, 40),
+    timer:sleep(400),
+    make_jims(Cache, 41, 60),
+    timer:sleep(500),
+    ?assertMatch(60, proplists:get_value(datum_count, pcache:stats(Cache))),
+    pcache:expire(Cache, 20),   %% Expire 1st wave of jims
+    timer:sleep(100),
+    ?assertMatch(40, proplists:get_value(datum_count, pcache:stats(Cache))).
+    
 
 %%% =======================================================================
 %%% Test random values
@@ -360,8 +388,8 @@ check_speed(Cache) ->
     lists:all(fun(V) -> V =:= V1 end, Result1),
     {Time2, Result2} = timer:tc(?MODULE, many_pings, [Cache, Repeat_Count]),
     lists:all(fun(V) -> V =:= V2 end, Result2),
-    error_logger:info_msg("~p pcache:get requests takes ~p seconds~n", [Repeat_Count, Time1 / 1000000]),
-    error_logger:info_msg("~p pcache:age requests takes ~p seconds~n", [Repeat_Count, Time2 / 1000000]),
+    error_logger:info_msg("~p pcache:get requests take ~p seconds~n", [Repeat_Count, Time1 / 1000000]),
+    error_logger:info_msg("~p pcache:age requests take ~p seconds~n", [Repeat_Count, Time2 / 1000000]),
     ok.
 
 many_gets(Cache, Count)  -> [pcache:get(Cache, "jim1") || _N <- lists:seq(1,Count)].
