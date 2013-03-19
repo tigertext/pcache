@@ -383,15 +383,23 @@ check_speed(Cache) ->
     V1 = pcache:get(Cache, "jim1"),
     timer:sleep(1000),
     V2 = pcache:age(Cache, "jim1"),
-    Repeat_Count = 50000,
+    Repeat_Count = 100000,
     {Time1, Result1} = timer:tc(?MODULE, many_gets,  [Cache, Repeat_Count]),
     lists:all(fun(V) -> V =:= V1 end, Result1),
     {Time2, Result2} = timer:tc(?MODULE, many_pings, [Cache, Repeat_Count]),
     lists:all(fun(V) -> V =:= V2 end, Result2),
-    error_logger:info_msg("~p pcache:get requests take ~p seconds~n", [Repeat_Count, Time1 / 1000000]),
-    error_logger:info_msg("~p pcache:age requests take ~p seconds~n", [Repeat_Count, Time2 / 1000000]),
+    Seconds1 = Time1 / 1000000,
+    error_logger:info_msg("~p pcache:get requests take ~p seconds at ~p reqs/sec~n",
+                          [Repeat_Count, Seconds1, Repeat_Count / Seconds1 ]),
+    Seconds2 = Time2 / 1000000,
+    error_logger:info_msg("~p pcache:age requests take ~p seconds at ~p reqs/sec~n",
+                          [Repeat_Count, Seconds2, Repeat_Count / Seconds2]),
+
+    %% Try using a pdict...
+    {ok, Pdict_Cache} = pcache_server:start_link(tc, ?MODULE, tester, 6, 300000, lru, pdict),
+    V1 = pcache:get(Pdict_Cache, "jim1"),
     ok.
 
 many_gets(Cache, Count)  -> [pcache:get(Cache, "jim1") || _N <- lists:seq(1,Count)].
-many_pings(Cache, Count) -> [pcache:get(Cache, "jim1") || _N <- lists:seq(1,Count)].
+many_pings(Cache, Count) -> [pcache:age(Cache, "jim1") || _N <- lists:seq(1,Count)].
     

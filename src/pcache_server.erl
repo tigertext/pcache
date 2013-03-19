@@ -2,7 +2,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/3, start_link/4, start_link/5, start_link/6]).
+-export([start_link/3, start_link/4, start_link/5, start_link/6, start_link/7]).
 -export([init/1, handle_call/3, handle_cast/2,
          handle_info/2, terminate/2, code_change/3]).
 
@@ -38,7 +38,10 @@ start_link(Name, Mod, Fun, CacheSize, CacheTime) ->
 
 start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy)
   when CachePolicy =:= lru; CachePolicy =:= actual_time ->
-    Args = [Name, Mod, Fun, CacheSize, CacheTime, CachePolicy],
+    start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy, ets).
+
+start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy, Index_Type) ->
+    Args = {Name, Mod, Fun, CacheSize, CacheTime, CachePolicy, Index_Type},
     gen_server:start_link({local, Name}, ?MODULE, Args, []).
 
 
@@ -46,32 +49,40 @@ start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy)
 %%% Init and gen_server state, terminate, code_change and locate functions
 %%%----------------------------------------------------------------------
 
-init([Name, Mod, Fun, CacheSize, CacheTime, CachePolicy]) ->
-  Index_Type = ets,
-  DatumIndex = create_index(Index_Type, Name),
-  CacheSizeBytes = CacheSize*1024*1024,
+init({Name, Mod, Fun, CacheSize, CacheTime, CachePolicy, Index_Type})
+  when Index_Type =:= ets; Index_Type =:= pdict ->
+    DatumIndex = create_index(Index_Type, Name),
+    CacheSizeBytes = CacheSize*1024*1024,
 
-  {ok, ReaperPid} = pcache_reaper:start(Name, CacheSizeBytes),
-  erlang:monitor(process, ReaperPid),
+    {ok, ReaperPid} = pcache_reaper:start(Name, CacheSizeBytes),
+    erlang:monitor(process, ReaperPid),
 
-  State = #cache{name          = Name,
-                 index_type    = Index_Type,
-                 datum_index   = DatumIndex,
-                 data_module   = Mod,
-                 data_accessor = Fun,
-                 reaper_pid    = ReaperPid,
-                 default_ttl   = CacheTime,
-                 cache_policy  = CachePolicy,
-                 cache_size    = CacheSizeBytes,
-                 cache_used    = 0},
-  {ok, State}.
+    State = #cache{name          = Name,
+                   index_type    = Index_Type,
+                   datum_index   = DatumIndex,
+                   data_module   = Mod,
+                   data_accessor = Fun,
+                   reaper_pid    = ReaperPid,
+                   default_ttl   = CacheTime,
+                   cache_policy  = CachePolicy,
+                   cache_size    = CacheSizeBytes,
+                   cache_used    = 0},
+    {ok, State}.
 
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
 terminate(_Reason, _State) -> ok.
 
+%% locate(DatumKey, #cache{index_type = pdict,      datum_index = DatumIndex, data_module = DataModule,
+%%                         default_ttl = DefaultTTL, cache_policy = Policy, data_accessor = DataAccessor}) ->
+%%   UseKey = key(DatumKey),
+%%   case index_lookup(Index_Type, DatumIndex, UseKey) of 
+%%     [{UseKey, Value, _Size}] -> Value;
+%%     [] -> launch_datum(Index_Type, DatumKey, UseKey, DatumIndex, DataModule, DataAccessor, DefaultTTL, Policy)
+%%   end;
 locate(DatumKey, #cache{index_type = Index_Type, datum_index = DatumIndex, data_module = DataModule,
                         default_ttl = DefaultTTL, cache_policy = Policy, data_accessor = DataAccessor}) ->
   UseKey = key(DatumKey),
+    error_logger:error_msg("Checking index: ~p ~p ~p~n", [Index_Type, DatumIndex, UseKey]),
   case index_lookup(Index_Type, DatumIndex, UseKey) of 
     [{UseKey, Pid, _Size}] when is_pid(Pid) -> Pid;
     [] -> launch_datum(Index_Type, DatumKey, UseKey, DatumIndex, DataModule, DataAccessor, DefaultTTL, Policy)
@@ -346,9 +357,16 @@ make_new_datum(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy) ->
             exit(crashed)
     end.
 
+%% launch_datum(pdict, DatumKey, UseKey, DatumIndex, Module, Accessor, TTL, CachePolicy) ->
+%%   Datum_Args = [self(), DatumKey, UseKey, Module, Accessor, TTL, CachePolicy],
+%%   {Datum_Pid, _Monitor} = erlang:spawn_monitor(?MODULE, datum_launch, Datum_Args),
+%%   index_insert(Index_Type, DatumIndex, UseKey, {UseKey, Datum_Pid, 0}),
+%%   Datum_Pid.
 launch_datum(Index_Type, DatumKey, UseKey, DatumIndex, Module, Accessor, TTL, CachePolicy) ->
   Datum_Args = [self(), DatumKey, UseKey, Module, Accessor, TTL, CachePolicy],
+    error_logger:error_msg("Launching datum: ~p~n", [Datum_Args]),
   {Datum_Pid, _Monitor} = erlang:spawn_monitor(?MODULE, datum_launch, Datum_Args),
+    error_logger:error_msg("Datum launched: ~p~n", [Datum_Pid]),
   index_insert(Index_Type, DatumIndex, UseKey, {UseKey, Datum_Pid, 0}),
   Datum_Pid.
 
