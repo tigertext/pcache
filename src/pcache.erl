@@ -30,7 +30,10 @@ cache_ttl_sup(Name, Mod, Fun, Size, TTL) ->
 
 change_default_ttl(ServerName, New_TTL) ->
   gen_server:call(ServerName, {change_default_ttl, New_TTL}).
-    
+
+fetch(ServerName, Key) ->    
+  pcache_server:fetch(ServerName, Key).
+
 get(ServerName, Key) ->
   gen_server:call(ServerName, {get, Key}, ?FAST_TIMEOUT).
 
