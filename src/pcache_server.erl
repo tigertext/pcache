@@ -44,8 +44,6 @@ start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy)
 start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy, Index_Type) ->
     Args = {Name, Mod, Fun, CacheSize, CacheTime, CachePolicy, Index_Type},
     Server_Name = list_to_atom(atom_to_list(Name) ++ "_pcache"),
-error_logger:error_msg("Creating ~p with ~p args~n", [Server_Name, Args]),
-undefined = ets:info(tc, name),
     gen_server:start_link({local, Server_Name}, ?MODULE, Args, []).
 
 fetch(ServerName, DatumKey) ->
@@ -66,20 +64,19 @@ init({Name, Mod, Fun, CacheSize, CacheTime, CachePolicy, Index_Type})
     DatumIndex = create_index(Index_Type, Name),
     CacheSizeBytes = CacheSize*1024*1024,
 
-%%    {ok, ReaperPid} = pcache_reaper:start(Name, CacheSizeBytes),
-%%    erlang:monitor(process, ReaperPid),
+    {ok, ReaperPid} = pcache_reaper:start(Name, CacheSizeBytes),
+    erlang:monitor(process, ReaperPid),
 
     State = #cache{name          = Name,
                    index_type    = Index_Type,
                    datum_index   = DatumIndex,
                    data_module   = Mod,
                    data_accessor = Fun,
-%%                   reaper_pid    = ReaperPid,
+                   reaper_pid    = ReaperPid,
                    default_ttl   = CacheTime,
                    cache_policy  = CachePolicy,
                    cache_size    = CacheSizeBytes,
                    cache_used    = 0},
-error_logger:error_msg("Returning state ~p~n", [State]),
     {ok, State}.
 
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
@@ -134,7 +131,6 @@ handle_call({generic_get, M, F, Key}, From,
     {noreply, State};
 
 handle_call({get, Key}, From, #cache{} = State) ->
-error_logger:error_msg("Getting key ~p~n", [Key]),
     DatumPid = locate(Key, State),
     DatumPid ! {get, From},
     {noreply, State};
@@ -159,14 +155,11 @@ handle_call(empty, _From, #cache{index_type = Index_Type, datum_index = DatumInd
     %% We don't wait synchronously, so the make_ref() is just for a consistent interface message.
     Ref = make_ref(),
     Destroy_Fn = fun({DatumKey, DatumPid, _Size}, Items) ->
-                         error_logger:error_msg("Destroying ~p~n", [DatumPid]),
                          DatumPid ! {destroy, Ref, self()},
                          [DatumKey | Items]
                  end,
     Items_Destroyed = index_foldl(Index_Type, Destroy_Fn, [], DatumIndex),
-    error_logger:error_msg("Delete keys ~p ~p ~p~n", [Index_Type, DatumIndex, Items_Destroyed]),
     _ = [index_delete(Index_Type, DatumIndex, Key) || Key <- Items_Destroyed],
-    error_logger:error_msg("Done deleting keys~n"),
     {reply, length(Items_Destroyed), State#cache{cache_used = 0}};
 
 handle_call(reap_oldest, _From, #cache{index_type = Index_Type, datum_index = DatumIndex} = State) ->
@@ -463,7 +456,7 @@ datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
 
     {destroy, Ref, From} ->
       From ! {destroy, Ref, self(), ok},
-      error_logger:error_msg("destroying ~p with last access of ~p~n", [self(), LastActive]),
+      %% error_logger:error_msg("destroying ~p with last access of ~p~n", [self(), LastActive]),
       exit(self(), destroy);
 
     %% Request to expire if less than Pct_TTL_Remaining...
@@ -491,8 +484,8 @@ datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
 
   after
     TTL ->
-        % INSERT STATS COLLECTION INFO HERE
-        error_logger:error_msg("Cache object ~p owned by ~p freed~n", [Key, self()]),
+        %% INSERT STATS COLLECTION INFO HERE
+        %% error_logger:error_msg("Cache object ~p owned by ~p freed~n", [Key, self()]),
       cache_is_now_dead
   end.
 
@@ -501,23 +494,21 @@ datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
 %%% Generalize index for datum pids to allow alternatives to ets
 %%%----------------------------------------------------------------------
 
+create_index(pdict, _Name) -> pdict;
 create_index(ets,    Name) -> ets:new(Name, [named_table, set, protected,
-                                             {read_concurrency, true}]);
-create_index(pdict, _Name) -> pdict.
+                                             {read_concurrency, true}]).
 
-index_count(ets, Ets_Table) -> ets:info(Ets_Table, size);
-index_count(pdict, pdict)   -> length(get()).   %% This is very inefficient
+index_count(pdict, pdict)     -> length(get());   %% This is very inefficient
+index_count(ets,   Ets_Table) -> ets:info(Ets_Table, size).
 
-index_insert(ets, Datum_Index, _Key, Value) -> ets:insert(Datum_Index, Value);
-index_insert(pdict, pdict, Key, Value)      -> put(Key, Value), true.
+index_insert(pdict, pdict,        Key, Value) -> put(Key, [Value]), true;
+index_insert(ets,   Datum_Index, _Key, Value) -> ets:insert(Datum_Index, Value).
 
-index_lookup(ets, Datum_Index, Key) -> ets:lookup(Datum_Index, Key);
-index_lookup(pdict, pdict, Key)     -> get(Key).
+index_lookup(pdict, pdict,       Key) -> case get(Key) of undefined -> []; Value -> Value end;
+index_lookup(ets,   Datum_Index, Key) -> ets:lookup(Datum_Index, Key).
 
-index_delete(ets, Datum_Index, Key) -> ets:delete(Datum_Index, Key);
-index_delete(pdict, pdict, Key)     -> erase(Key), true.
+index_delete(pdict, pdict,       Key) -> erase(Key), true;
+index_delete(ets,   Datum_Index, Key) -> ets:delete(Datum_Index, Key).
 
-index_foldl(ets, Fun, Init_Acc, Datum_Index) ->
-    ets:foldl(Fun, Init_Acc, Datum_Index);
-index_foldl(pdict, Fun, Init_Acc, pdict) ->
-    lists:foldl(Fun, Init_Acc, get()).
+index_foldl(pdict, Fun, Init_Acc, pdict)       -> lists:foldl(Fun, Init_Acc, get());
+index_foldl(ets,   Fun, Init_Acc, Datum_Index) -> ets:foldl(Fun, Init_Acc, Datum_Index).
