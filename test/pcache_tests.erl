@@ -119,15 +119,15 @@ pcache_datum_crash_setup() ->
   {ok, Pid} = pcache_server:start_link(tc, ?MODULE, crash_tester, 6, 300000),
   Pid.
 
-%% pcache_datum_crash_test_() ->
-%%   {setup, fun pcache_datum_crash_setup/0, fun pcache_cleanup/1,
-%%    {with, [fun check_mfa_crash/1]}
-%%   }.
+pcache_datum_crash_test_() ->
+  {setup, fun pcache_datum_crash_setup/0, fun pcache_cleanup/1,
+   {with, [fun check_mfa_crash/1]}
+  }.
 
-%% check_mfa_crash(Cache) ->
-%% %%    ?assertMatch('** pcache_tests:crash_tester(<<"Binary_Token">>) Crashed! error:badarg **',
-%%     ?assertException(exit,{timeout,_}, pcache:get(Cache, <<"Binary_Token">>)),
-%%     ok.
+check_mfa_crash(Cache) ->
+%%    ?assertMatch('** pcache_tests:crash_tester(<<"Binary_Token">>) Crashed! error:badarg **',
+    ?assertException(exit,{timeout,_}, pcache:get(Cache, <<"Binary_Token">>)),
+    ok.
     
   
 
@@ -400,6 +400,9 @@ check_ets_speed(Cache) ->
     Repeat_Count = 100000,
     Millis_Per_Micro = 1000000,
 
+    Key_Fetch = "jimFetch",
+    V_Fetch = pcache:fetch(Cache, tc, Key_Fetch),
+
     %% Try using get (which funnels through a central gen_server)...
     {Time1, _Result1} = timer:tc(?MODULE, many_same_gets, [Cache, Key, V1, Repeat_Count]),
     Seconds1 = Time1 / Millis_Per_Micro,
@@ -407,7 +410,7 @@ check_ets_speed(Cache) ->
                           [Repeat_Count, Seconds1, Repeat_Count / Seconds1 ]),
 
     %% Try using fetch (which uses read_concurrency on an ets table)...
-    {Time2, _Result2} = timer:tc(?MODULE, many_same_fetches, [Cache, tc, Key, V1, Repeat_Count]),
+    {Time2, _Result2} = timer:tc(?MODULE, many_same_fetches, [Cache, tc, Key_Fetch, V_Fetch, Repeat_Count]),
     Seconds2 = Time2 / Millis_Per_Micro,
     error_logger:info_msg("~p pcache:fetch requests take ~p seconds at ~p reqs/sec~n",
                            [Repeat_Count, Seconds2, Repeat_Count / Seconds2 ]),
