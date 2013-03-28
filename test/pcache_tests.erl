@@ -5,7 +5,7 @@
         ]).
 
 %% Spawned functions
--export([notify/3, many_gets/3, many_pings/3]).
+-export([notify/3, many_same_gets/4, many_pings/4, many_same_fetches/5]).
 
 
 %%% =======================================================================
@@ -119,15 +119,15 @@ pcache_datum_crash_setup() ->
   {ok, Pid} = pcache_server:start_link(tc, ?MODULE, crash_tester, 6, 300000),
   Pid.
 
-pcache_datum_crash_test_() ->
-  {setup, fun pcache_datum_crash_setup/0, fun pcache_cleanup/1,
-   {with, [fun check_mfa_crash/1]}
-  }.
+%% pcache_datum_crash_test_() ->
+%%   {setup, fun pcache_datum_crash_setup/0, fun pcache_cleanup/1,
+%%    {with, [fun check_mfa_crash/1]}
+%%   }.
 
-check_mfa_crash(Cache) ->
-%%    ?assertMatch('** pcache_tests:crash_tester(<<"Binary_Token">>) Crashed! error:badarg **',
-    ?assertException(exit,{timeout,_}, pcache:get(Cache, <<"Binary_Token">>)),
-    ok.
+%% check_mfa_crash(Cache) ->
+%% %%    ?assertMatch('** pcache_tests:crash_tester(<<"Binary_Token">>) Crashed! error:badarg **',
+%%     ?assertException(exit,{timeout,_}, pcache:get(Cache, <<"Binary_Token">>)),
+%%     ok.
     
   
 
@@ -389,42 +389,66 @@ check_rand(Cache) ->
 
 pcache_speed_test_() ->
   {setup, fun pcache_fast_ttl_setup/0, fun pcache_cleanup/1,
-    {with, [fun check_speed/1]}
+    {with, [fun check_ets_speed/1, fun check_pdict_speed/1]}
   }.
 
-check_speed(Cache) ->
-    V1 = pcache:get(Cache, "jim1"),
+check_ets_speed(Cache) ->
+    Key = "jim1",
+    V1 = pcache:get(Cache, Key),
     timer:sleep(100),
-    V2 = pcache:age(Cache, "jim1"),
+    V2 = pcache:age(Cache, Key),
     Repeat_Count = 100000,
-    {Time1, _Result1} = timer:tc(?MODULE, many_gets,  [Cache, V1, Repeat_Count]),
-    Seconds1 = Time1 / 1000000,
+    Millis_Per_Micro = 1000000,
+
+    %% Try using get (which funnels through a central gen_server)...
+    {Time1, _Result1} = timer:tc(?MODULE, many_same_gets, [Cache, Key, V1, Repeat_Count]),
+    Seconds1 = Time1 / Millis_Per_Micro,
     error_logger:info_msg("~p pcache:get requests take ~p seconds at ~p reqs/sec~n",
                           [Repeat_Count, Seconds1, Repeat_Count / Seconds1 ]),
-    {Time2, _Result2} = timer:tc(?MODULE, many_pings, [Cache, V2, Repeat_Count]),
-    Seconds2 = Time2 / 1000000,
-    error_logger:info_msg("~p pcache:age requests take ~p seconds at ~p reqs/sec~n",
-                          [Repeat_Count, Seconds2, Repeat_Count / Seconds2]),
 
-    %% Try using a pdict...
-    {ok, Pdict_Cache} = pcache_server:start_link(tc2, ?MODULE, tester, 6, 300000, lru, pdict),
-    {Time3, _Result3} = timer:tc(?MODULE, many_gets, [Pdict_Cache, V1, Repeat_Count]),
-    Seconds3 = Time3 / 1000000,
-    error_logger:info_msg("~p pcache:get pdict requests take ~p seconds at ~p reqs/sec~n",
+    %% Try using fetch (which uses read_concurrency on an ets table)...
+    {Time2, _Result2} = timer:tc(?MODULE, many_same_fetches, [Cache, tc, Key, V1, Repeat_Count]),
+    Seconds2 = Time2 / Millis_Per_Micro,
+    error_logger:info_msg("~p pcache:fetch requests take ~p seconds at ~p reqs/sec~n",
+                           [Repeat_Count, Seconds2, Repeat_Count / Seconds2 ]),
+
+    %% Check the age of an item repeatedly.
+    {Time3, _Result3} = timer:tc(?MODULE, many_pings, [Cache, Key, V2, Repeat_Count]),
+    Seconds3 = Time3 / Millis_Per_Micro,
+    error_logger:info_msg("~p pcache:age requests take ~p seconds at ~p reqs/sec~n",
                           [Repeat_Count, Seconds3, Repeat_Count / Seconds3]),
-    {Time4, _Result4} = timer:tc(?MODULE, many_pings, [Pdict_Cache, V2, Repeat_Count]),
-    Seconds4 = Time4 / 1000000,
-    error_logger:info_msg("~p pcache:age pdict requests take ~p seconds at ~p reqs/sec~n",
-                          [Repeat_Count, Seconds4, Repeat_Count / Seconds4]),
     ok.
 
-many_gets(_Cache, _Val, 0) -> ok;
-many_gets(Cache, Val, N) ->
-    Val = pcache:get(Cache, "jim1"),
-    many_gets(Cache, Val, N-1).
+check_pdict_speed(Cache) ->
+    Key = "jim2",
+    V1 = pcache:get(Cache, Key),
+    timer:sleep(100),
+    V2 = pcache:age(Cache, Key),
+    Repeat_Count = 100000,
+    Millis_Per_Micro = 1000000,
+
+    {Time1, _Result1} = timer:tc(?MODULE, many_same_gets, [Cache, Key, V1, Repeat_Count]),
+    Seconds1 = Time1 / Millis_Per_Micro,
+    error_logger:info_msg("~p pcache:get pdict requests take ~p seconds at ~p reqs/sec~n",
+                          [Repeat_Count, Seconds1, Repeat_Count / Seconds1]),
+    {Time2, _Result2} = timer:tc(?MODULE, many_pings, [Cache, Key, V2, Repeat_Count]),
+    Seconds2 = Time2 / Millis_Per_Micro,
+    error_logger:info_msg("~p pcache:age pdict requests take ~p seconds at ~p reqs/sec~n",
+                          [Repeat_Count, Seconds2, Repeat_Count / Seconds2]),
+    ok.
+
+many_same_gets(_Cache, _Key, _Val, 0) -> ok;
+many_same_gets(Cache, Key, Val, N) ->
+    Val = pcache:get(Cache, Key),
+    many_same_gets(Cache, Key, Val, N-1).
+
+many_same_fetches(_Server, _Ets, _Key, _Val, 0) -> ok;
+many_same_fetches(Server, Ets, Key, Val, N) ->
+    Val = pcache:fetch(Server, Ets, Key),
+    many_same_fetches(Server, Ets, Key, Val, N-1).
     
-many_pings(_Cache, _Val, 0) -> ok;
-many_pings(Cache, _Val, N) ->
-    pcache:age(Cache, "jim1"),
-    many_pings(Cache, _Val, N-1).
+many_pings(_Cache, _Key, _Val, 0) -> ok;
+many_pings(Cache, Key, _Val, N) ->
+    pcache:age(Cache, Key),
+    many_pings(Cache, Key, _Val, N-1).
     

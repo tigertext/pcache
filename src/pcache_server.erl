@@ -3,7 +3,7 @@
 -behaviour(gen_server).
 
 -export([start_link/3, start_link/4, start_link/5, start_link/6, start_link/7,
-         fetch/2]).
+         fetch/3]).
 -export([init/1, handle_call/3, handle_cast/2,
          handle_info/2, terminate/2, code_change/3]).
 
@@ -46,10 +46,10 @@ start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy, Index_Type) ->
     Server_Name = list_to_atom(atom_to_list(Name) ++ "_pcache"),
     gen_server:start_link({local, Server_Name}, ?MODULE, Args, []).
 
-fetch(ServerName, DatumKey) ->
+fetch(ServerName, EtsTable, DatumKey) ->
   UseKey = key(DatumKey),
-  case index_lookup(ets, ServerName, UseKey) of 
-      [{UseKey, Pid, _Size}] when is_pid(Pid) -> gen_server:call({get_from_pid, Pid});
+  case index_lookup(ets, EtsTable, UseKey) of 
+      [{UseKey, Pid, _Size}] when is_pid(Pid) -> gen_server:call(ServerName, {get_from_pid, Pid});
       [{UseKey, Val, _Size}] -> Val;
       [] -> gen_server:call(ServerName, {get, UseKey})
   end.
