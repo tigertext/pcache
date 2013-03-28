@@ -178,14 +178,14 @@ handle_call(reap_oldest, _From, #cache{index_type = Index_Type, datum_index = Da
                    Oldest_Pid ->
                        Oldest_Pid ! {destroy, Ref, self()},
                        %% There can only be 1 entry in an ets 'set' table, so don't scan full table.
-                       delete_one_ets_entry_by_pid(DatumIndex, Oldest_Pid, State)
+                       delete_one_entry_by_pid(DatumIndex, Oldest_Pid, State)
                end,
     {reply, ok, NewState};
 
 handle_call({rand, Type, Num_Desired}, _From, #cache{index_type = Index_Type, datum_index = Datum_Index} = State) ->
     Datum_Count = index_count(Index_Type, Datum_Index),
     Indices = [crypto:rand_uniform(1, Datum_Count+1) || _ <- lists:seq(1, Num_Desired)],
-    Rand_Fn = fun(_Ets_Entry, {Pids, Ets_Item_Pos, []}) -> {Pids, Ets_Item_Pos+1, []};
+    Rand_Fn = fun(_Ets_Entry, {Pids, Ets_Item_Pos, []})   -> {Pids, Ets_Item_Pos+1, []};
                  ({_UseKey, Datum_Pid, _Size}, {Pids, Ets_Item_Pos, Wanted_Pid_Positions}) ->
                       Fetch_Positions = lists:takewhile(fun(Pos) -> Pos =:= Ets_Item_Pos end, Wanted_Pid_Positions),
                       Fetch_Pids = lists:duplicate(length(Fetch_Positions), Datum_Pid),
@@ -281,7 +281,7 @@ handle_info({'DOWN', _Ref, process, DatumPid, _Reason},
   end,
 
   %% There can only be 1 entry in an ets 'set' table, so don't scan full table.
-  New_State = delete_one_ets_entry_by_pid(DatumIndex, DatumPid, State),
+  New_State = delete_one_entry_by_pid(DatumIndex, DatumPid, State),
   {noreply, New_State};
 
 handle_info(_Info, State) ->
@@ -293,12 +293,19 @@ handle_info(_Info, State) ->
 %% Private
 %% ===================================================================
 
-delete_one_ets_entry_by_pid(DatumIndex, DatumPid, #cache{index_type = Index_Type, cache_used = Used} = State) ->
+delete_one_entry_by_pid(DatumIndex, DatumPid, #cache{index_type = pdict, cache_used = Used} = State) ->
+    case [Val || {_Key, [{_Key, Pid, _Size} = Val]} <- get(), Pid =:= DatumPid] of
+        [] -> State;
+        [{Key, DatumPid, Size}] ->
+            index_delete(pdict, DatumIndex, Key),
+            State#cache{cache_used = Used - Size}
+    end;
+delete_one_entry_by_pid(DatumIndex, DatumPid, #cache{index_type = ets, cache_used = Used} = State) ->
     case ets:match_object(DatumIndex, {'_', DatumPid, '_'}, 1) of
         '$end_of_table' -> State;
         {[], _Cont_Fn}  -> State; 
         {[{UseKey, DatumPid, Size}], _Cont_Fn} ->
-            index_delete(Index_Type, DatumIndex, UseKey),
+            index_delete(ets, DatumIndex, UseKey),
             State#cache{cache_used = Used - Size}
     end.
 
@@ -510,5 +517,7 @@ index_lookup(ets,   Datum_Index, Key) -> ets:lookup(Datum_Index, Key).
 index_delete(pdict, pdict,       Key) -> erase(Key), true;
 index_delete(ets,   Datum_Index, Key) -> ets:delete(Datum_Index, Key).
 
-index_foldl(pdict, Fun, Init_Acc, pdict)       -> lists:foldl(Fun, Init_Acc, get());
-index_foldl(ets,   Fun, Init_Acc, Datum_Index) -> ets:foldl(Fun, Init_Acc, Datum_Index).
+index_foldl(ets,   Fun, Init_Acc, Datum_Index) -> ets:foldl(Fun, Init_Acc, Datum_Index);
+index_foldl(pdict, Fun, Init_Acc, pdict) ->
+    Terms = [V || {K,[V]} <- get(), K =/= '$ancestors', K =/= '$initial_call'],
+    lists:foldl(Fun, Init_Acc, Terms).

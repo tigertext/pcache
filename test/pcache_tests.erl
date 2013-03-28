@@ -5,7 +5,7 @@
         ]).
 
 %% Spawned functions
--export([notify/3, many_same_gets/4, many_pings/4, many_same_fetches/5]).
+-export([notify/3, many_gets/3, many_fetches/4, many_pings/3]).
 
 
 %%% =======================================================================
@@ -29,7 +29,10 @@ pcache_cleanup(Cache) ->
             orelse begin unlink(whereis(tc2_pcache)), unregister(tc2_pcache) end
     catch Class:Error -> error_logger:error_msg("Caught ~p:~p~n", [Class, Error])
     end,
-    exit(Cache, kill).  %% Fails with 'normal' for some reason.
+    exit(Cache, kill),
+    timer:sleep(100),
+    ok.
+
 
 pcache_test_() ->
   {foreach, fun pcache_setup/0, fun pcache_cleanup/1,
@@ -387,71 +390,126 @@ check_rand(Cache) ->
 %%% Test get vs. last_active performance (cost of now())
 %%% =======================================================================
 
-pcache_speed_test_() ->
-  {setup, fun pcache_fast_ttl_setup/0, fun pcache_cleanup/1,
-    {with, [fun check_ets_speed/1, fun check_pdict_speed/1]}
+pcache_crypto_setup() ->
+  crypto:start(),
+  %% start cache server tc (test cache), 6 MB cache, 2 second TTL per entry
+  {ok, Pid} = pcache_server:start_link(tc, ?MODULE, tester, 6, 2000),
+  Pid.
+
+pcache_ets_speed_test_() ->
+  {setup, fun pcache_crypto_setup/0, fun pcache_cleanup/1,
+    {with, [fun check_ets_speed/1]}
   }.
 
 check_ets_speed(Cache) ->
-    Key = "jim1",
-    V1 = pcache:get(Cache, Key),
-    timer:sleep(100),
-    V2 = pcache:age(Cache, Key),
-    Repeat_Count = 100000,
-    Millis_Per_Micro = 1000000,
 
-    Key_Fetch = "jimFetch",
-    V_Fetch = pcache:fetch(Cache, tc, Key_Fetch),
+    %% Create a set of random {Key,Val} pairs and create them all in the cache...
+    {Noise_Count, Lookup_Count} = {29000,1000},
+    Noise_Pairs = gen_randoms(Noise_Count, []),
+    Random_Pairs = gen_randoms(Lookup_Count, []),
+    [Val = pcache:get(Cache, Key) || {Key, Val} <- Random_Pairs ++ Noise_Pairs],
+
+    timer:sleep(100),
+    Repeat_Count = 10,
+    Millis_Per_Micro = 1000000,
 
     %% Try using get (which funnels through a central gen_server)...
-    {Time1, _Result1} = timer:tc(?MODULE, many_same_gets, [Cache, Key, V1, Repeat_Count]),
+    {Time1, _Result1} = timer:tc(?MODULE, many_gets, [Cache, Random_Pairs, Repeat_Count]),
     Seconds1 = Time1 / Millis_Per_Micro,
-    error_logger:info_msg("~p pcache:get requests take ~p seconds at ~p reqs/sec~n",
-                          [Repeat_Count, Seconds1, Repeat_Count / Seconds1 ]),
+    error_logger:info_msg("~p pcache:get using ets requests for ~p items of ~p total "
+                          "takes ~p seconds at ~p reqs/sec~n",
+                          [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
+                           Seconds1, Repeat_Count / Seconds1 ]),
 
     %% Try using fetch (which uses read_concurrency on an ets table)...
-    {Time2, _Result2} = timer:tc(?MODULE, many_same_fetches, [Cache, tc, Key_Fetch, V_Fetch, Repeat_Count]),
+    {Time2, _Result2} = timer:tc(?MODULE, many_fetches, [Cache, tc, Random_Pairs, Repeat_Count]),
     Seconds2 = Time2 / Millis_Per_Micro,
-    error_logger:info_msg("~p pcache:fetch requests take ~p seconds at ~p reqs/sec~n",
-                           [Repeat_Count, Seconds2, Repeat_Count / Seconds2 ]),
+    error_logger:info_msg("~p pcache:fetch using concurrent ets requests for ~p items of ~p total "
+                          "takes ~p seconds at ~p reqs/sec~n",
+                          [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
+                           Seconds2, Repeat_Count / Seconds2 ]),
 
-    %% Check the age of an item repeatedly.
-    {Time3, _Result3} = timer:tc(?MODULE, many_pings, [Cache, Key, V2, Repeat_Count]),
+    %% Check the age of random keys.
+    {Time3, _Result3} = timer:tc(?MODULE, many_pings, [Cache, Random_Pairs, Repeat_Count]),
     Seconds3 = Time3 / Millis_Per_Micro,
-    error_logger:info_msg("~p pcache:age requests take ~p seconds at ~p reqs/sec~n",
-                          [Repeat_Count, Seconds3, Repeat_Count / Seconds3]),
+    error_logger:info_msg("~p pcache:age using ets requests for ~p items of ~p total "
+                          "takes ~p seconds at ~p reqs/sec~n",
+                          [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
+                           Seconds3, Repeat_Count / Seconds3 ]),
     ok.
+
+pcache_pdict_crypto_setup() ->
+  crypto:start(),
+  %% start cache server tc (test cache), 6 MB cache, 2 second TTL per entry
+  {ok, Pid} = pcache_server:start_link(tc, ?MODULE, tester, 6, 2000, lru, pdict),
+  Pid.
+
+pcache_pdict_speed_test_() ->
+  {setup, fun pcache_pdict_crypto_setup/0, fun pcache_cleanup/1,
+    {with, [fun check_pdict_speed/1]}
+  }.
 
 check_pdict_speed(Cache) ->
-    Key = "jim2",
-    V1 = pcache:get(Cache, Key),
+
+    %% Create a set of random {Key,Val} pairs and create them all in the cache...
+    {Noise_Count, Lookup_Count} = {29000,1000},
+    Noise_Pairs = gen_randoms(Noise_Count, []),
+    Random_Pairs = gen_randoms(Lookup_Count, []),
+    [Val = pcache:get(Cache, Key) || {Key, Val} <- Random_Pairs ++ Noise_Pairs],
+
     timer:sleep(100),
-    V2 = pcache:age(Cache, Key),
-    Repeat_Count = 100000,
+    Repeat_Count = 10,
     Millis_Per_Micro = 1000000,
 
-    {Time1, _Result1} = timer:tc(?MODULE, many_same_gets, [Cache, Key, V1, Repeat_Count]),
+    %% Try using get (which funnels through a central gen_server+pdict)...
+    {Time1, _Result1} = timer:tc(?MODULE, many_gets, [Cache, Random_Pairs, Repeat_Count]),
     Seconds1 = Time1 / Millis_Per_Micro,
-    error_logger:info_msg("~p pcache:get pdict requests take ~p seconds at ~p reqs/sec~n",
-                          [Repeat_Count, Seconds1, Repeat_Count / Seconds1]),
-    {Time2, _Result2} = timer:tc(?MODULE, many_pings, [Cache, Key, V2, Repeat_Count]),
-    Seconds2 = Time2 / Millis_Per_Micro,
-    error_logger:info_msg("~p pcache:age pdict requests take ~p seconds at ~p reqs/sec~n",
-                          [Repeat_Count, Seconds2, Repeat_Count / Seconds2]),
+    error_logger:info_msg("~p pcache:get using pdict requests for ~p items of ~p total "
+                          "takes ~p seconds at ~p reqs/sec~n",
+                          [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
+                           Seconds1, Repeat_Count / Seconds1 ]),
+
+    %% Check the age of random keys.
+    {Time3, _Result3} = timer:tc(?MODULE, many_pings, [Cache, Random_Pairs, Repeat_Count]),
+    Seconds3 = Time3 / Millis_Per_Micro,
+    error_logger:info_msg("~p pcache:age using pdict requests for ~p items of ~p total "
+                          "takes ~p seconds at ~p reqs/sec~n",
+                          [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
+                           Seconds3, Repeat_Count / Seconds3 ]),
     ok.
 
-many_same_gets(_Cache, _Key, _Val, 0) -> ok;
-many_same_gets(Cache, Key, Val, N) ->
-    Val = pcache:get(Cache, Key),
-    many_same_gets(Cache, Key, Val, N-1).
+gen_randoms(0, Results) -> Results;
+gen_randoms(N, Results) ->
+    Key = crypto:rand_bytes(32),
+    Val = erlang:md5(Key),
+    gen_randoms(N-1, [{Key, Val} | Results]).
+    
+many_gets(_Cache, _Pairs, 0) -> ok;
+many_gets( Cache,  Pairs, N) -> 
+    get_all_vals(Cache, Pairs),
+    many_gets(Cache, Pairs, N-1).
 
-many_same_fetches(_Server, _Ets, _Key, _Val, 0) -> ok;
-many_same_fetches(Server, Ets, Key, Val, N) ->
-    Val = pcache:fetch(Server, Ets, Key),
-    many_same_fetches(Server, Ets, Key, Val, N-1).
+get_all_vals(_Cache, []) -> ok;
+get_all_vals( Cache, [{Key, Val} | More]) -> 
+    Val = pcache:get(Cache, Key),
+    get_all_vals(Cache, More).
     
-many_pings(_Cache, _Key, _Val, 0) -> ok;
-many_pings(Cache, Key, _Val, N) ->
-    pcache:age(Cache, Key),
-    many_pings(Cache, Key, _Val, N-1).
+many_fetches(_Cache, _Ets, _Pairs, 0) -> ok;
+many_fetches( Cache,  Ets, Pairs, N) -> 
+    fetch_all_vals(Cache, Ets, Pairs),
+    many_fetches(Cache, Ets, Pairs, N-1).
+
+fetch_all_vals(_Cache, _Ets, []) -> ok;
+fetch_all_vals( Cache,  Ets, [{Key, Val} | More]) -> 
+    Val = pcache:fetch(Cache, Ets, Key),
+    fetch_all_vals(Cache, Ets, More).
     
+many_pings(_Cache, _Pairs, 0) -> ok;
+many_pings( Cache,  Pairs, N) -> 
+    ping_all_vals(Cache, Pairs),
+    many_pings(Cache, Pairs, N-1).
+
+ping_all_vals(_Cache, []) -> ok;
+ping_all_vals( Cache, [{Key, _Val} | More]) -> 
+    true = is_tuple(pcache:age(Cache, Key)),
+    ping_all_vals(Cache, More).
