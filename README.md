@@ -55,7 +55,7 @@ Building
 
 Testing
 -------
-        rebar eunit suite=pcache
+        rebar eunit suites=pcache
 
 TODO
 ----

@@ -5,7 +5,8 @@
         ]).
 
 %% Spawned functions
--export([notify/3, many_gets/2, many_pings/2]).
+-export([notify/3, pause_get/4, pause_fetch/5, collect_gets/1, collect_fetches/1,
+         many_pings/3]).
 
 
 %%% =======================================================================
@@ -21,9 +22,18 @@ pcache_setup() ->
   Pid.
 
 pcache_cleanup(Cache) ->
-    pcache:empty(Cache),
-    unregister(tc),
-    exit(Cache, normal).
+    try
+        pcache:empty(Cache),
+        whereis(tc_pcache)  =:= undefined
+            orelse begin unlink(whereis(tc_pcache)),  unregister(tc_pcache)  end,
+        whereis(tc2_pcache) =:= undefined
+            orelse begin unlink(whereis(tc2_pcache)), unregister(tc2_pcache) end
+    catch Class:Error -> error_logger:error_msg("Caught ~p:~p~n", [Class, Error])
+    end,
+    exit(Cache, kill),
+    timer:sleep(100),
+    ok.
+
 
 pcache_test_() ->
   {foreach, fun pcache_setup/0, fun pcache_cleanup/1,
@@ -35,22 +45,22 @@ pcache_test_() ->
 check_get_and_dirty(_Cache) ->
     Bob_Value = erlang:md5("bob"),
     Bob2_Value = erlang:md5("bob2"),
-    ?assertMatch(Bob_Value,  pcache:get(tc, "bob")),
-    ?assertMatch(Bob2_Value, pcache:get(tc, "bob2")),
+    ?assertMatch(Bob_Value,  pcache:get(tc_pcache, "bob")),
+    ?assertMatch(Bob2_Value, pcache:get(tc_pcache, "bob2")),
     timer:sleep(10),
-    Stats1 = pcache:stats(tc),
+    Stats1 = pcache:stats(tc_pcache),
     ?assertMatch([tc, 2], [proplists:get_value(P, Stats1) || P <- [cache_name, datum_count]]),
 
-    ?assertMatch(ok, pcache:dirty(tc, "bob2")),
-    ?assertMatch(ok, pcache:dirty(tc, "bob2")),
+    ?assertMatch(ok, pcache:dirty(tc_pcache, "bob2")),
+    ?assertMatch(ok, pcache:dirty(tc_pcache, "bob2")),
     Bob2_Crc = erlang:crc32("bob2"),
-    ?assertMatch(Bob2_Crc, pcache:memoize(tc, ?MODULE, memoize_tester, "bob2")),
-    ?assertMatch(ok, pcache:dirty_memoize(tc, ?MODULE, memoize_tester, "bob2")),
+    ?assertMatch(Bob2_Crc, pcache:memoize(tc_pcache, ?MODULE, memoize_tester, "bob2")),
+    ?assertMatch(ok, pcache:dirty_memoize(tc_pcache, ?MODULE, memoize_tester, "bob2")),
     timer:sleep(10),
 
-    Stats2 = pcache:stats(tc),
+    Stats2 = pcache:stats(tc_pcache),
     ?assertMatch([tc, 1], [proplists:get_value(P, Stats2) || P <- [cache_name, datum_count]]),
-    ?assertMatch(1, pcache:empty(tc)).
+    ?assertMatch(1, pcache:empty(tc_pcache)).
 
 check_cache_size(Cache) ->
     ?assertMatch(0, pcache:total_size(Cache)),
@@ -59,7 +69,7 @@ check_cache_size(Cache) ->
     Size1 = pcache:total_size(Cache),
     ?assert(is_integer(Size1) andalso Size1 > 0),
     ?assertMatch(Size1, proplists:get_value(memory_used, pcache:stats(Cache))),
-    pcache:get(tc, "bob2"),
+    pcache:get(tc_pcache, "bob2"),
     timer:sleep(10),
     Size2 = pcache:total_size(Cache),
     ?assert(is_integer(Size2) andalso Size2 > Size1),
@@ -93,7 +103,7 @@ check_cache_size(Cache) ->
     Size1 = pcache:total_size(Cache),
     ?assert(is_integer(Size1) andalso Size1 > 0),
     ?assertMatch(Size1, proplists:get_value(memory_used, pcache:stats(Cache))),
-    pcache:get(tc, "bob2"),
+    pcache:get(tc_pcache, "bob2"),
     timer:sleep(10),
     Size2 = pcache:total_size(Cache),
     ?assert(is_integer(Size2) andalso Size2 > Size1),
@@ -135,11 +145,15 @@ pcache_queue_test_() ->
 
 load_msg_queue(Cache, Key, Num_Requesters, Caller) ->
     Notify_Fn = fun() -> Caller ! {datum, pcache:get(Cache, Key)} end,
-    [spawn(Notify_Fn) || _N <- lists:seq(1,Num_Requesters)].
+    load_1_msg(Notify_Fn, Num_Requesters).
+    
+load_1_msg(_Notify_Fn, 0) -> ok;
+load_1_msg(Notify_Fn, N) -> spawn(Notify_Fn), load_1_msg(Notify_Fn, N-1).
+                             
     
 check_msg_queue_speed(Cache) ->
     Result = erlang:md5("jim"),
-    ?assertMatch(Result, pcache:get(tc, "jim")),
+    ?assertMatch(Result, pcache:get(tc_pcache, "jim")),
 
     Msg_Count_1 = 1000,
     load_msg_queue(Cache, "jim", Msg_Count_1, self()),
@@ -164,8 +178,8 @@ check_msg_queue_speed(Cache) ->
     ?assertMatch([[{msg_count, Msg_Count_1}, {avg_time, Avg_Time_1}, {fast_enough, true}],
                   [{msg_count, Msg_Count_2}, {avg_time, Avg_Time_2}, {fast_enough, true}],
                   [{msg_count, Msg_Count_3}, {avg_time, Avg_Time_3}, {fast_enough, true}]],
-                 Speeds).
-                                     
+                 Speeds),
+    ok.
 
 get_results(0)     -> ok;
 get_results(Count) ->
@@ -224,8 +238,8 @@ check_spawn_speed(Cache) ->
     Slow_Fetches = [[{latency, Micros}, {key, Key}, {result, Result}]
                     || {datum, Key, Micros, Result} <- Results, Micros > 300],
     ?assertMatch([], Slow_Fetches),
-    ?assertMatch([], [R || {datum, _Key, _Micros, R} <- Results, R =/= Existing_Result]).
-
+    ?assertMatch([], [R || {datum, _Key, _Micros, R} <- Results, R =/= Existing_Result]),
+    ok.
 
 %%% =======================================================================
 %%% Test dirty followed immediately by get doesn't timeout
@@ -242,7 +256,7 @@ check_dirty_timeout(Cache) ->
     ?assertMatch(Bob_Value,  pcache:get(Cache, "bob")),
     ?assertMatch(Bob2_Value, pcache:get(Cache, "bob2")),
     timer:sleep(10),
-    Stats = pcache:stats(tc),
+    Stats = pcache:stats(tc_pcache),
     ?assertMatch([tc, 2], [proplists:get_value(P, Stats) || P <- [cache_name, datum_count]]),
 
     ?assertMatch(ok, pcache:dirty(Cache, "bob2")),
@@ -268,7 +282,8 @@ check_default_ttl(Cache) ->
     ?assertMatch(2000, proplists:get_value(default_ttl, pcache:stats(Cache))),
     ?assertMatch(2000, pcache:change_default_ttl(Cache, 3000)),
     ?assertMatch(3000, proplists:get_value(default_ttl, pcache:stats(Cache))),
-    ?assertMatch(3000, pcache:change_default_ttl(Cache, 2000)).
+    ?assertMatch(3000, pcache:change_default_ttl(Cache, 2000)),
+    ok.
 
 check_ttl(Cache) ->
     pcache:get(Cache, "jim1"),
@@ -279,7 +294,8 @@ check_ttl(Cache) ->
     timer:sleep(1000),
     ?assertMatch(1, proplists:get_value(datum_count, pcache:stats(Cache))),
     timer:sleep(1000),
-    ?assertMatch(0, proplists:get_value(datum_count, pcache:stats(Cache))).
+    ?assertMatch(0, proplists:get_value(datum_count, pcache:stats(Cache))),
+    ok.
 
 pcache_oldest_test_() ->
   {setup, fun pcache_setup/0, fun pcache_cleanup/1,
@@ -298,7 +314,8 @@ check_reap_oldest(Cache) ->
     gen_server:call(Cache, reap_oldest),
     timer:sleep(1000),
     Ages2 = lists:sort(gen_server:call(Cache, ages)),
-    ?assertMatch(Ages2, tl(Ages1)).
+    ?assertMatch(Ages2, tl(Ages1)),
+    ok.
 
 pcache_lemmings_test_() ->
   {setup, fun pcache_fast_ttl_setup/0, fun pcache_cleanup/1,
@@ -319,8 +336,8 @@ check_mass_expire(Cache) ->
     ?assertMatch(60, proplists:get_value(datum_count, pcache:stats(Cache))),
     pcache:expire(Cache, 20),   %% Expire 1st wave of jims
     timer:sleep(100),
-    ?assertMatch(40, proplists:get_value(datum_count, pcache:stats(Cache))).
-    
+    ?assertMatch(40, proplists:get_value(datum_count, pcache:stats(Cache))),
+    ok.
 
 %%% =======================================================================
 %%% Test random values
@@ -367,31 +384,199 @@ check_rand(Cache) ->
     ?assertMatch(3, length(Rand_Key_1)),
     ?assertMatch(3, length([K || K <- Rand_Key_2, string:substr(K, 1, 4) == "fred"])),
     ?assertMatch(3, length(Rand_Key_2)),
-    ?assert(Rand_Key_1 =/= Rand_Key_2).
-    
+    ?assert(Rand_Key_1 =/= Rand_Key_2),
+    ok.
 
 %%% =======================================================================
 %%% Test get vs. last_active performance (cost of now())
 %%% =======================================================================
 
-pcache_speed_test_() ->
-  {setup, fun pcache_fast_ttl_setup/0, fun pcache_cleanup/1,
-    {with, [fun check_speed/1]}
+pcache_crypto_setup() ->
+  crypto:start(),
+  %% start cache server tc (test cache), 6 MB cache, 2 second TTL per entry
+  {ok, Pid} = pcache_server:start_link(tc, ?MODULE, tester, 6, 2000),
+  Pid.
+
+pcache_ets_speed_test_() ->
+  {foreach, fun pcache_crypto_setup/0, fun pcache_cleanup/1,
+    [
+     {with, [fun check_ets_speed/1]},
+     {with, [fun check_fetch_speed/1]},
+     {with, [fun check_age_speed/1]}
+    ]
   }.
 
-check_speed(Cache) ->
-    V1 = pcache:get(Cache, "jim1"),
-    timer:sleep(1000),
-    V2 = pcache:age(Cache, "jim1"),
-    Repeat_Count = 50000,
-    {Time1, Result1} = timer:tc(?MODULE, many_gets,  [Cache, Repeat_Count]),
-    lists:all(fun(V) -> V =:= V1 end, Result1),
-    {Time2, Result2} = timer:tc(?MODULE, many_pings, [Cache, Repeat_Count]),
-    lists:all(fun(V) -> V =:= V2 end, Result2),
-    error_logger:info_msg("~p pcache:get requests take ~p seconds~n", [Repeat_Count, Time1 / 1000000]),
-    error_logger:info_msg("~p pcache:age requests take ~p seconds~n", [Repeat_Count, Time2 / 1000000]),
+check_ets_speed(Cache) ->
+    %% Create a set of random {Key,Val} pairs and create them all in the cache...
+    {Noise_Count, Lookup_Count} = {29000,1000},
+    Noise_Pairs = gen_randoms(Noise_Count, []),
+    Random_Pairs = gen_randoms(Lookup_Count, []),
+    [Val = pcache:get(Cache, Key) || {Key, Val} <- Random_Pairs ++ Noise_Pairs],
+
+    timer:sleep(100),
+    Repeat_Count = 15,
+    Millis_Per_Micro = 1000000,
+
+    %% Try using get (which funnels through a central gen_server)...
+    Get_Pids = [spawn(?MODULE, pause_get, [Cache, K, V, Repeat_Count]) || {K,V} <- Random_Pairs],
+    {Time1, _Result1} = timer:tc(?MODULE, collect_gets, [Get_Pids]),
+    Seconds1 = Time1 / Millis_Per_Micro,
+    error_logger:info_msg("~p pcache:get using ets requests for ~p items of ~p total "
+                          "takes ~p seconds at ~p reqs/sec~n",
+                          [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
+                           Seconds1, (Repeat_Count * Lookup_Count) / Seconds1 ]),
     ok.
 
-many_gets(Cache, Count)  -> [pcache:get(Cache, "jim1") || _N <- lists:seq(1,Count)].
-many_pings(Cache, Count) -> [pcache:get(Cache, "jim1") || _N <- lists:seq(1,Count)].
+check_fetch_speed(Cache) ->
+    %% Create a set of random {Key,Val} pairs and create them all in the cache...
+    {Noise_Count, Lookup_Count} = {29000,1000},
+    Noise_Pairs = gen_randoms(Noise_Count, []),
+    Random_Pairs = gen_randoms(Lookup_Count, []),
+    [Val = pcache:get(Cache, Key) || {Key, Val} <- Random_Pairs ++ Noise_Pairs],
+
+    timer:sleep(100),
+    Repeat_Count = 15,
+    Millis_Per_Micro = 1000000,
+
+    %% Try using fetch (which uses read_concurrency on an ets table)...
+    Fetch_Pids = [spawn(?MODULE, pause_fetch, [Cache, tc, K, V, Repeat_Count]) || {K,V} <- Random_Pairs],
+    {Time2, _Result2} = timer:tc(?MODULE, collect_fetches, [Fetch_Pids]),
+    Seconds2 = Time2 / Millis_Per_Micro,
+    error_logger:info_msg("~p pcache:fetch using concurrent ets requests for ~p items of ~p total "
+                          "takes ~p seconds at ~p reqs/sec~n",
+                          [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
+                           Seconds2, (Repeat_Count * Lookup_Count) / Seconds2 ]),
+    ok.
+
+check_age_speed(Cache) ->
+    %% Create a set of random {Key,Val} pairs and create them all in the cache...
+    {Noise_Count, Lookup_Count} = {29000,1000},
+    Noise_Pairs = gen_randoms(Noise_Count, []),
+    Random_Pairs = gen_randoms(Lookup_Count, []),
+    [Val = pcache:get(Cache, Key) || {Key, Val} <- Random_Pairs ++ Noise_Pairs],
+
+    timer:sleep(100),
+    Repeat_Count = 15,
+    Millis_Per_Micro = 1000000,
+
+    %% Check the age of random keys sequentially, not concurrently.
+    {Time3, _Result3} = timer:tc(?MODULE, many_pings, [Cache, Random_Pairs, Repeat_Count]),
+    Seconds3 = Time3 / Millis_Per_Micro,
+    error_logger:info_msg("~p pcache:age using seq ets requests for ~p items of ~p total "
+                          "takes ~p seconds at ~p reqs/sec~n",
+                          [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
+                           Seconds3, (Repeat_Count * Lookup_Count) / Seconds3 ]),
+    ok.
+
+pcache_pdict_crypto_setup() ->
+  crypto:start(),
+  %% start cache server tc (test cache), 6 MB cache, 2 second TTL per entry
+  {ok, Pid} = pcache_server:start_link(tc, ?MODULE, tester, 6, 2000, lru, pdict),
+  Pid.
+
+pcache_pdict_speed_test_() ->
+  {foreach, fun pcache_pdict_crypto_setup/0, fun pcache_cleanup/1,
+    [
+     {with, [fun check_pdict_speed/1]},
+     {with, [fun check_pdict_age_speed/1]}
+    ]
+  }.
+
+check_pdict_speed(Cache) ->
+    %% Create a set of random {Key,Val} pairs and create them all in the cache...
+    {Noise_Count, Lookup_Count} = {29000,1000},
+    Noise_Pairs = gen_randoms(Noise_Count, []),
+    Random_Pairs = gen_randoms(Lookup_Count, []),
+    [Val = pcache:get(Cache, Key) || {Key, Val} <- Random_Pairs ++ Noise_Pairs],
+
+    timer:sleep(100),
+    Repeat_Count = 15,
+    Millis_Per_Micro = 1000000,
+
+    %% Try using get (which funnels through a central gen_server+pdict)...
+    Get_Pids = [spawn(?MODULE, pause_get, [Cache, K, V, Repeat_Count]) || {K,V} <- Random_Pairs],
+    {Time1, _Result1} = timer:tc(?MODULE, collect_gets, [Get_Pids]),
+    Seconds1 = Time1 / Millis_Per_Micro,
+    error_logger:info_msg("~p pcache:get using pdict requests for ~p items of ~p total "
+                          "takes ~p seconds at ~p reqs/sec~n",
+                          [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
+                           Seconds1, (Repeat_Count * Lookup_Count) / Seconds1 ]),
+    ok.
+
+check_pdict_age_speed(Cache) ->
+    %% Create a set of random {Key,Val} pairs and create them all in the cache...
+    {Noise_Count, Lookup_Count} = {29000,1000},
+    Noise_Pairs = gen_randoms(Noise_Count, []),
+    Random_Pairs = gen_randoms(Lookup_Count, []),
+    [Val = pcache:get(Cache, Key) || {Key, Val} <- Random_Pairs ++ Noise_Pairs],
+
+    timer:sleep(100),
+    Repeat_Count = 15,
+    Millis_Per_Micro = 1000000,
+
+    %% Check the age of random keys sequentially, not concurrently.
+    {Time2, _Result2} = timer:tc(?MODULE, many_pings, [Cache, Random_Pairs, Repeat_Count]),
+    Seconds2 = Time2 / Millis_Per_Micro,
+    error_logger:info_msg("~p pcache:age using seq pdict requests for ~p items of ~p total "
+                          "takes ~p seconds at ~p reqs/sec~n",
+                          [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
+                           Seconds2, (Repeat_Count * Lookup_Count) / Seconds2 ]),
+    ok.
+
+gen_randoms(0, Results) -> Results;
+gen_randoms(N, Results) ->
+    Key = crypto:rand_bytes(32),
+    Val = erlang:md5(Key),
+    gen_randoms(N-1, [{Key, Val} | Results]).
+
+collect_gets(Pids) ->
+    Count = length(Pids),
+    [Pid ! {start, self()} || Pid <- Pids],
+    collect_get_vals(Count).
     
+collect_get_vals(0) -> success;
+collect_get_vals(N) ->
+    receive get_done -> collect_get_vals(N-1)
+    after 5000 -> throw(timeout)
+    end.
+            
+pause_get(Cache, Key, Value, Repeat_Count) ->
+    receive {start, Collector} -> get_all_vals(Collector, Cache, Key, Value, Repeat_Count)
+    after 5000 -> throw(timeout)
+    end.
+
+get_all_vals(Collector, _Cache, _Key, _Val, 0) -> Collector ! get_done;
+get_all_vals(Collector,  Cache,  Key,  Val, N) -> 
+    Val = pcache:get(Cache, Key),
+    get_all_vals(Collector, Cache, Key, Val, N-1).
+
+collect_fetches(Pids) ->
+    Count = length(Pids),
+    [Pid ! {start, self()} || Pid <- Pids],
+    collect_fetch_vals(Count).
+    
+collect_fetch_vals(0) -> success;
+collect_fetch_vals(N) ->
+    receive fetch_done -> collect_fetch_vals(N-1)
+    after 5000 -> throw(timeout)
+    end.
+
+pause_fetch(Cache, Ets, Key, Value, Repeat_Count) ->
+    receive {start, Collector} -> fetch_all_vals(Collector, Cache, Ets, Key, Value, Repeat_Count)
+    after 5000 -> timeout
+    end.
+
+fetch_all_vals(Collector, _Cache, _Ets, _Key, _Val, 0) -> Collector ! fetch_done;
+fetch_all_vals(Collector,  Cache,  Ets,  Key,  Val, N) -> 
+    Val = pcache:fetch(Cache, Ets, Key),
+    fetch_all_vals(Collector, Cache, Ets, Key, Val, N-1).
+    
+many_pings(_Cache, _Pairs, 0) -> ok;
+many_pings( Cache,  Pairs, N) -> 
+    ping_all_vals(Cache, Pairs),
+    many_pings(Cache, Pairs, N-1).
+
+ping_all_vals(_Cache, []) -> ok;
+ping_all_vals( Cache, [{Key, _Val} | More]) -> 
+    true = is_tuple(pcache:age(Cache, Key)),
+    ping_all_vals(Cache, More).
