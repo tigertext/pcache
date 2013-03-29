@@ -5,7 +5,8 @@
         ]).
 
 %% Spawned functions
--export([notify/3, many_gets/3, many_fetches/4, many_pings/3]).
+-export([notify/3, pause_get/4, pause_fetch/5, collect_gets/1, collect_fetches/1,
+         many_pings/3]).
 
 
 %%% =======================================================================
@@ -410,24 +411,26 @@ check_ets_speed(Cache) ->
     [Val = pcache:get(Cache, Key) || {Key, Val} <- Random_Pairs ++ Noise_Pairs],
 
     timer:sleep(100),
-    Repeat_Count = 10,
+    Repeat_Count = 15,
     Millis_Per_Micro = 1000000,
 
     %% Try using get (which funnels through a central gen_server)...
-    {Time1, _Result1} = timer:tc(?MODULE, many_gets, [Cache, Random_Pairs, Repeat_Count]),
+    Get_Pids = [spawn(?MODULE, pause_get, [Cache, K, V, Repeat_Count]) || {K,V} <- Random_Pairs],
+    {Time1, _Result1} = timer:tc(?MODULE, collect_gets, [Get_Pids]),
     Seconds1 = Time1 / Millis_Per_Micro,
     error_logger:info_msg("~p pcache:get using ets requests for ~p items of ~p total "
                           "takes ~p seconds at ~p reqs/sec~n",
                           [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
-                           Seconds1, Repeat_Count / Seconds1 ]),
+                           Seconds1, (Repeat_Count * Lookup_Count) / Seconds1 ]),
 
     %% Try using fetch (which uses read_concurrency on an ets table)...
-    {Time2, _Result2} = timer:tc(?MODULE, many_fetches, [Cache, tc, Random_Pairs, Repeat_Count]),
+    Fetch_Pids = [spawn(?MODULE, pause_fetch, [Cache, tc, K, V, Repeat_Count]) || {K,V} <- Random_Pairs],
+    {Time2, _Result2} = timer:tc(?MODULE, collect_fetches, [Fetch_Pids]),
     Seconds2 = Time2 / Millis_Per_Micro,
     error_logger:info_msg("~p pcache:fetch using concurrent ets requests for ~p items of ~p total "
                           "takes ~p seconds at ~p reqs/sec~n",
                           [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
-                           Seconds2, Repeat_Count / Seconds2 ]),
+                           Seconds2, (Repeat_Count * Lookup_Count) / Seconds2 ]),
 
     %% Check the age of random keys.
     {Time3, _Result3} = timer:tc(?MODULE, many_pings, [Cache, Random_Pairs, Repeat_Count]),
@@ -435,7 +438,7 @@ check_ets_speed(Cache) ->
     error_logger:info_msg("~p pcache:age using ets requests for ~p items of ~p total "
                           "takes ~p seconds at ~p reqs/sec~n",
                           [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
-                           Seconds3, Repeat_Count / Seconds3 ]),
+                           Seconds3, (Repeat_Count * Lookup_Count) / Seconds3 ]),
     ok.
 
 pcache_pdict_crypto_setup() ->
@@ -458,24 +461,25 @@ check_pdict_speed(Cache) ->
     [Val = pcache:get(Cache, Key) || {Key, Val} <- Random_Pairs ++ Noise_Pairs],
 
     timer:sleep(100),
-    Repeat_Count = 10,
+    Repeat_Count = 15,
     Millis_Per_Micro = 1000000,
 
     %% Try using get (which funnels through a central gen_server+pdict)...
-    {Time1, _Result1} = timer:tc(?MODULE, many_gets, [Cache, Random_Pairs, Repeat_Count]),
+    Get_Pids = [spawn(?MODULE, pause_get, [Cache, K, V, Repeat_Count]) || {K,V} <- Random_Pairs],
+    {Time1, _Result1} = timer:tc(?MODULE, collect_gets, [Get_Pids]),
     Seconds1 = Time1 / Millis_Per_Micro,
-    error_logger:info_msg("~p pcache:get using pdict requests for ~p items of ~p total "
+    error_logger:info_msg("~p pcache:get using ets requests for ~p items of ~p total "
                           "takes ~p seconds at ~p reqs/sec~n",
                           [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
-                           Seconds1, Repeat_Count / Seconds1 ]),
+                           Seconds1, (Repeat_Count * Lookup_Count) / Seconds1 ]),
 
     %% Check the age of random keys.
-    {Time3, _Result3} = timer:tc(?MODULE, many_pings, [Cache, Random_Pairs, Repeat_Count]),
-    Seconds3 = Time3 / Millis_Per_Micro,
-    error_logger:info_msg("~p pcache:age using pdict requests for ~p items of ~p total "
+    {Time2, _Result2} = timer:tc(?MODULE, many_pings, [Cache, Random_Pairs, Repeat_Count]),
+    Seconds2 = Time2 / Millis_Per_Micro,
+    error_logger:info_msg("~p pcache:age using ets requests for ~p items of ~p total "
                           "takes ~p seconds at ~p reqs/sec~n",
                           [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
-                           Seconds3, Repeat_Count / Seconds3 ]),
+                           Seconds2, (Repeat_Count * Lookup_Count) / Seconds2 ]),
     ok.
 
 gen_randoms(0, Results) -> Results;
@@ -483,26 +487,48 @@ gen_randoms(N, Results) ->
     Key = crypto:rand_bytes(32),
     Val = erlang:md5(Key),
     gen_randoms(N-1, [{Key, Val} | Results]).
-    
-many_gets(_Cache, _Pairs, 0) -> ok;
-many_gets( Cache,  Pairs, N) -> 
-    get_all_vals(Cache, Pairs),
-    many_gets(Cache, Pairs, N-1).
 
-get_all_vals(_Cache, []) -> ok;
-get_all_vals( Cache, [{Key, Val} | More]) -> 
+collect_gets(Pids) ->
+    Count = length(Pids),
+    [Pid ! {start, self()} || Pid <- Pids],
+    collect_get_vals(Count).
+    
+collect_get_vals(0) -> success;
+collect_get_vals(N) ->
+    receive get_done -> collect_get_vals(N-1)
+    after 5000 -> throw(timeout)
+    end.
+            
+pause_get(Cache, Key, Value, Repeat_Count) ->
+    receive {start, Collector} -> get_all_vals(Collector, Cache, Key, Value, Repeat_Count)
+    after 5000 -> throw(timeout)
+    end.
+
+get_all_vals(Collector, _Cache, _Key, _Val, 0) -> Collector ! get_done;
+get_all_vals(Collector,  Cache,  Key,  Val, N) -> 
     Val = pcache:get(Cache, Key),
-    get_all_vals(Cache, More).
-    
-many_fetches(_Cache, _Ets, _Pairs, 0) -> ok;
-many_fetches( Cache,  Ets, Pairs, N) -> 
-    fetch_all_vals(Cache, Ets, Pairs),
-    many_fetches(Cache, Ets, Pairs, N-1).
+    get_all_vals(Collector, Cache, Key, Val, N-1).
 
-fetch_all_vals(_Cache, _Ets, []) -> ok;
-fetch_all_vals( Cache,  Ets, [{Key, Val} | More]) -> 
+collect_fetches(Pids) ->
+    Count = length(Pids),
+    [Pid ! {start, self()} || Pid <- Pids],
+    collect_fetch_vals(Count).
+    
+collect_fetch_vals(0) -> success;
+collect_fetch_vals(N) ->
+    receive fetch_done -> collect_fetch_vals(N-1)
+    after 5000 -> throw(timeout)
+    end.
+
+pause_fetch(Cache, Ets, Key, Value, Repeat_Count) ->
+    receive {start, Collector} -> fetch_all_vals(Collector, Cache, Ets, Key, Value, Repeat_Count)
+    after 5000 -> timeout
+    end.
+
+fetch_all_vals(Collector, _Cache, _Ets, _Key, _Val, 0) -> Collector ! fetch_done;
+fetch_all_vals(Collector,  Cache,  Ets,  Key,  Val, N) -> 
     Val = pcache:fetch(Cache, Ets, Key),
-    fetch_all_vals(Cache, Ets, More).
+    fetch_all_vals(Collector, Cache, Ets, Key, Val, N-1).
     
 many_pings(_Cache, _Pairs, 0) -> ok;
 many_pings( Cache,  Pairs, N) -> 
