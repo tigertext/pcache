@@ -46,11 +46,18 @@ start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy, Index_Type) ->
     Server_Name = list_to_atom(atom_to_list(Name) ++ "_pcache"),
     gen_server:start_link({local, Server_Name}, ?MODULE, Args, []).
 
+%% This function runs in the caller's process space and attempts to fetch the
+%% datum pid. If it fails, it uses the gen_server to call 'get' and
+%% insert a new datum to the cache. Otherwise, we avoid the gen_server by
+%% routing directly to the datum pid.
 fetch(ServerName, EtsTable, DatumKey) ->
   UseKey = key(DatumKey),
   case index_lookup(ets, EtsTable, UseKey) of 
-      [{UseKey, Pid, _Size}] when is_pid(Pid) -> gen_server:call(ServerName, {get_from_pid, Pid});
-      [{UseKey, Val, _Size}] -> Val;
+      [{UseKey, Pid, _Size}] when is_pid(Pid) -> 
+          case get_data(Pid) of
+              {ok, Data} -> Data;
+              no_data -> no_data
+          end;
       [] -> gen_server:call(ServerName, {get, UseKey})
   end.
 
@@ -313,7 +320,7 @@ get_age(DatumPid) ->
     Ref = make_ref(),
     DatumPid ! {last_active, Ref, self()},
     receive {last_active, Ref, DatumPid, Last_Active} -> {Last_Active, DatumPid}
-    after 50 -> no_response
+    after 100 -> no_response
     end.
     
 filter_oldest(_Ref, 0, _Oldest_Active, Oldest_Pid) -> Oldest_Pid;
@@ -332,7 +339,7 @@ get_data(DatumPid, Timeout) ->
   Ref = make_ref(),
   DatumPid ! {get, Ref, self()},
   receive {get, Ref, DatumPid, Data} -> {ok, Data}
-  after Timeout -> {no_data, timeout}
+  after Timeout -> no_data
   end.
 
 get_key(DatumPid) -> get_key(DatumPid, 100).
@@ -340,7 +347,7 @@ get_key(DatumPid, Timeout) ->
   Ref = make_ref(),
   DatumPid ! {getkey, Ref, self()},
   receive {getkey, Ref, DatumPid, Key} -> {ok, Key}
-  after Timeout -> {no_data, timeout}
+  after Timeout -> no_data
   end.
 
 -record(datum, {
@@ -505,8 +512,8 @@ create_index(pdict, _Name) -> pdict;
 create_index(ets,    Name) -> ets:new(Name, [named_table, set, protected,
                                              {read_concurrency, true}]).
 
-index_count(pdict, pdict)     -> length(get());   %% This is very inefficient
-index_count(ets,   Ets_Table) -> ets:info(Ets_Table, size).
+index_count(pdict,  pdict)     -> length(get());   %% This is very inefficient
+index_count(ets,    Ets_Table) -> ets:info(Ets_Table, size).
 
 index_insert(pdict, pdict,        Key, Value) -> put(Key, [Value]), true;
 index_insert(ets,   Datum_Index, _Key, Value) -> ets:insert(Datum_Index, Value).
@@ -517,7 +524,7 @@ index_lookup(ets,   Datum_Index, Key) -> ets:lookup(Datum_Index, Key).
 index_delete(pdict, pdict,       Key) -> erase(Key), true;
 index_delete(ets,   Datum_Index, Key) -> ets:delete(Datum_Index, Key).
 
-index_foldl(ets,   Fun, Init_Acc, Datum_Index) -> ets:foldl(Fun, Init_Acc, Datum_Index);
-index_foldl(pdict, Fun, Init_Acc, pdict) ->
+index_foldl(ets,    Fun, Init_Acc, Datum_Index) -> ets:foldl(Fun, Init_Acc, Datum_Index);
+index_foldl(pdict,  Fun, Init_Acc, pdict) ->
     Terms = [V || {K,[V]} <- get(), K =/= '$ancestors', K =/= '$initial_call'],
     lists:foldl(Fun, Init_Acc, Terms).

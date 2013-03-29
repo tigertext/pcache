@@ -398,12 +398,15 @@ pcache_crypto_setup() ->
   Pid.
 
 pcache_ets_speed_test_() ->
-  {setup, fun pcache_crypto_setup/0, fun pcache_cleanup/1,
-    {with, [fun check_ets_speed/1]}
+  {foreach, fun pcache_crypto_setup/0, fun pcache_cleanup/1,
+    [
+     {with, [fun check_ets_speed/1]},
+     {with, [fun check_fetch_speed/1]},
+     {with, [fun check_age_speed/1]}
+    ]
   }.
 
 check_ets_speed(Cache) ->
-
     %% Create a set of random {Key,Val} pairs and create them all in the cache...
     {Noise_Count, Lookup_Count} = {29000,1000},
     Noise_Pairs = gen_randoms(Noise_Count, []),
@@ -422,6 +425,18 @@ check_ets_speed(Cache) ->
                           "takes ~p seconds at ~p reqs/sec~n",
                           [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
                            Seconds1, (Repeat_Count * Lookup_Count) / Seconds1 ]),
+    ok.
+
+check_fetch_speed(Cache) ->
+    %% Create a set of random {Key,Val} pairs and create them all in the cache...
+    {Noise_Count, Lookup_Count} = {29000,1000},
+    Noise_Pairs = gen_randoms(Noise_Count, []),
+    Random_Pairs = gen_randoms(Lookup_Count, []),
+    [Val = pcache:get(Cache, Key) || {Key, Val} <- Random_Pairs ++ Noise_Pairs],
+
+    timer:sleep(100),
+    Repeat_Count = 15,
+    Millis_Per_Micro = 1000000,
 
     %% Try using fetch (which uses read_concurrency on an ets table)...
     Fetch_Pids = [spawn(?MODULE, pause_fetch, [Cache, tc, K, V, Repeat_Count]) || {K,V} <- Random_Pairs],
@@ -431,11 +446,23 @@ check_ets_speed(Cache) ->
                           "takes ~p seconds at ~p reqs/sec~n",
                           [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
                            Seconds2, (Repeat_Count * Lookup_Count) / Seconds2 ]),
+    ok.
 
-    %% Check the age of random keys.
+check_age_speed(Cache) ->
+    %% Create a set of random {Key,Val} pairs and create them all in the cache...
+    {Noise_Count, Lookup_Count} = {29000,1000},
+    Noise_Pairs = gen_randoms(Noise_Count, []),
+    Random_Pairs = gen_randoms(Lookup_Count, []),
+    [Val = pcache:get(Cache, Key) || {Key, Val} <- Random_Pairs ++ Noise_Pairs],
+
+    timer:sleep(100),
+    Repeat_Count = 15,
+    Millis_Per_Micro = 1000000,
+
+    %% Check the age of random keys sequentially, not concurrently.
     {Time3, _Result3} = timer:tc(?MODULE, many_pings, [Cache, Random_Pairs, Repeat_Count]),
     Seconds3 = Time3 / Millis_Per_Micro,
-    error_logger:info_msg("~p pcache:age using ets requests for ~p items of ~p total "
+    error_logger:info_msg("~p pcache:age using seq ets requests for ~p items of ~p total "
                           "takes ~p seconds at ~p reqs/sec~n",
                           [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
                            Seconds3, (Repeat_Count * Lookup_Count) / Seconds3 ]),
@@ -448,12 +475,14 @@ pcache_pdict_crypto_setup() ->
   Pid.
 
 pcache_pdict_speed_test_() ->
-  {setup, fun pcache_pdict_crypto_setup/0, fun pcache_cleanup/1,
-    {with, [fun check_pdict_speed/1]}
+  {foreach, fun pcache_pdict_crypto_setup/0, fun pcache_cleanup/1,
+    [
+     {with, [fun check_pdict_speed/1]},
+     {with, [fun check_pdict_age_speed/1]}
+    ]
   }.
 
 check_pdict_speed(Cache) ->
-
     %% Create a set of random {Key,Val} pairs and create them all in the cache...
     {Noise_Count, Lookup_Count} = {29000,1000},
     Noise_Pairs = gen_randoms(Noise_Count, []),
@@ -468,15 +497,27 @@ check_pdict_speed(Cache) ->
     Get_Pids = [spawn(?MODULE, pause_get, [Cache, K, V, Repeat_Count]) || {K,V} <- Random_Pairs],
     {Time1, _Result1} = timer:tc(?MODULE, collect_gets, [Get_Pids]),
     Seconds1 = Time1 / Millis_Per_Micro,
-    error_logger:info_msg("~p pcache:get using ets requests for ~p items of ~p total "
+    error_logger:info_msg("~p pcache:get using pdict requests for ~p items of ~p total "
                           "takes ~p seconds at ~p reqs/sec~n",
                           [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
                            Seconds1, (Repeat_Count * Lookup_Count) / Seconds1 ]),
+    ok.
 
-    %% Check the age of random keys.
+check_pdict_age_speed(Cache) ->
+    %% Create a set of random {Key,Val} pairs and create them all in the cache...
+    {Noise_Count, Lookup_Count} = {29000,1000},
+    Noise_Pairs = gen_randoms(Noise_Count, []),
+    Random_Pairs = gen_randoms(Lookup_Count, []),
+    [Val = pcache:get(Cache, Key) || {Key, Val} <- Random_Pairs ++ Noise_Pairs],
+
+    timer:sleep(100),
+    Repeat_Count = 15,
+    Millis_Per_Micro = 1000000,
+
+    %% Check the age of random keys sequentially, not concurrently.
     {Time2, _Result2} = timer:tc(?MODULE, many_pings, [Cache, Random_Pairs, Repeat_Count]),
     Seconds2 = Time2 / Millis_Per_Micro,
-    error_logger:info_msg("~p pcache:age using ets requests for ~p items of ~p total "
+    error_logger:info_msg("~p pcache:age using seq pdict requests for ~p items of ~p total "
                           "takes ~p seconds at ~p reqs/sec~n",
                           [Repeat_Count, Lookup_Count, Noise_Count + Lookup_Count,
                            Seconds2, (Repeat_Count * Lookup_Count) / Seconds2 ]),
