@@ -1,7 +1,7 @@
 -module(pcache).
 -compile(export_all).
 
--export([change_default_ttl/2, get/2, get/3, age/2,
+-export([change_default_ttl/2, fetch/3, get/2, get/3, age/2,
          empty/1, total_size/1, stats/1,
          dirty/2, dirty/3, 
          rand/2, rand_keys/2]).
@@ -30,7 +30,10 @@ cache_ttl_sup(Name, Mod, Fun, Size, TTL) ->
 
 change_default_ttl(ServerName, New_TTL) ->
   gen_server:call(ServerName, {change_default_ttl, New_TTL}).
-    
+
+fetch(ServerName, EtsTable, Key) ->    
+  pcache_server:fetch(ServerName, EtsTable, Key).
+
 get(ServerName, Key) ->
   gen_server:call(ServerName, {get, Key}, ?FAST_TIMEOUT).
 

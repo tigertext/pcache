@@ -2,7 +2,8 @@
 
 -behaviour(gen_server).
 
--export([start_link/3, start_link/4, start_link/5, start_link/6]).
+-export([start_link/3, start_link/4, start_link/5, start_link/6, start_link/7,
+         fetch/3]).
 -export([init/1, handle_call/3, handle_cast/2,
          handle_info/2, terminate/2, code_change/3]).
 
@@ -38,33 +39,52 @@ start_link(Name, Mod, Fun, CacheSize, CacheTime) ->
 
 start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy)
   when CachePolicy =:= lru; CachePolicy =:= actual_time ->
-    Args = [Name, Mod, Fun, CacheSize, CacheTime, CachePolicy],
-    gen_server:start_link({local, Name}, ?MODULE, Args, []).
+    start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy, ets).
+
+start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy, Index_Type) ->
+    Args = {Name, Mod, Fun, CacheSize, CacheTime, CachePolicy, Index_Type},
+    Server_Name = list_to_atom(atom_to_list(Name) ++ "_pcache"),
+    gen_server:start_link({local, Server_Name}, ?MODULE, Args, []).
+
+%% This function runs in the caller's process space and attempts to fetch the
+%% datum pid. If it fails, it uses the gen_server to call 'get' and
+%% insert a new datum to the cache. Otherwise, we avoid the gen_server by
+%% routing directly to the datum pid.
+fetch(ServerName, EtsTable, DatumKey) ->
+  UseKey = key(DatumKey),
+  case index_lookup(ets, EtsTable, UseKey) of 
+      [{UseKey, Pid, _Size}] when is_pid(Pid) -> 
+          case get_data(Pid) of
+              {ok, Data} -> Data;
+              no_data -> no_data
+          end;
+      [] -> gen_server:call(ServerName, {get, UseKey})
+  end.
 
 
 %%%----------------------------------------------------------------------
 %%% Init and gen_server state, terminate, code_change and locate functions
 %%%----------------------------------------------------------------------
 
-init([Name, Mod, Fun, CacheSize, CacheTime, CachePolicy]) ->
-  Index_Type = ets,
-  DatumIndex = create_index(Index_Type, Name),
-  CacheSizeBytes = CacheSize*1024*1024,
+init({Name, Mod, Fun, CacheSize, CacheTime, CachePolicy, Index_Type})
+  when Index_Type =:= ets; Index_Type =:= pdict ->
+    DatumIndex = create_index(Index_Type, Name),
+    CacheSizeBytes = CacheSize*1024*1024,
 
-  {ok, ReaperPid} = pcache_reaper:start(Name, CacheSizeBytes),
-  erlang:monitor(process, ReaperPid),
+    {ok, ReaperPid} = pcache_reaper:start(Name, CacheSizeBytes),
+    erlang:monitor(process, ReaperPid),
 
-  State = #cache{name          = Name,
-                 index_type    = Index_Type,
-                 datum_index   = DatumIndex,
-                 data_module   = Mod,
-                 data_accessor = Fun,
-                 reaper_pid    = ReaperPid,
-                 default_ttl   = CacheTime,
-                 cache_policy  = CachePolicy,
-                 cache_size    = CacheSizeBytes,
-                 cache_used    = 0},
-  {ok, State}.
+    State = #cache{name          = Name,
+                   index_type    = Index_Type,
+                   datum_index   = DatumIndex,
+                   data_module   = Mod,
+                   data_accessor = Fun,
+                   reaper_pid    = ReaperPid,
+                   default_ttl   = CacheTime,
+                   cache_policy  = CachePolicy,
+                   cache_size    = CacheSizeBytes,
+                   cache_used    = 0},
+    {ok, State}.
 
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
 terminate(_Reason, _State) -> ok.
@@ -80,7 +100,7 @@ locate(DatumKey, #cache{index_type = Index_Type, datum_index = DatumIndex, data_
 locate_memoize(Index_Type, DatumKey, DatumIndex, DataModule, DataAccessor, DefaultTTL, Policy) ->
   UseKey = key(DataModule, DataAccessor, DatumKey),
   case index_lookup(Index_Type, DatumIndex, UseKey) of 
-    [{UseKey, Pid, _Size}] when is_pid(Pid) -> Pid;
+    [{UseKey, Datum_Pid, _Size}] when is_pid(Datum_Pid) -> get_data(Datum_Pid);
     [] -> launch_memoize_datum(Index_Type, DatumKey, UseKey, DatumIndex, DataModule, DataAccessor, DefaultTTL, Policy)
   end.
 
@@ -113,14 +133,16 @@ handle_call({location, DatumKey}, _From, State) ->
 handle_call({generic_get, M, F, Key}, From,
             #cache{index_type = Index_Type, datum_index = DatumIndex, default_ttl = DefaultTTL,
                    cache_policy = Policy} = State) ->
-    %% io:format("Requesting: ~p:~p(~p)~n", [M, F, Key]),
     DatumPid = locate_memoize(Index_Type, Key, DatumIndex, M, F, DefaultTTL, Policy),
     DatumPid ! {get, From},
     {noreply, State};
 
 handle_call({get, Key}, From, #cache{} = State) ->
-    %% io:format("Requesting: (~p)~n", [Key]),
     DatumPid = locate(Key, State),
+    DatumPid ! {get, From},
+    {noreply, State};
+
+handle_call({get_from_pid, DatumPid}, From, #cache{} = State) ->
     DatumPid ! {get, From},
     {noreply, State};
 
@@ -163,14 +185,14 @@ handle_call(reap_oldest, _From, #cache{index_type = Index_Type, datum_index = Da
                    Oldest_Pid ->
                        Oldest_Pid ! {destroy, Ref, self()},
                        %% There can only be 1 entry in an ets 'set' table, so don't scan full table.
-                       delete_one_ets_entry_by_pid(DatumIndex, Oldest_Pid, State)
+                       delete_one_entry_by_pid(DatumIndex, Oldest_Pid, State)
                end,
     {reply, ok, NewState};
 
 handle_call({rand, Type, Num_Desired}, _From, #cache{index_type = Index_Type, datum_index = Datum_Index} = State) ->
     Datum_Count = index_count(Index_Type, Datum_Index),
     Indices = [crypto:rand_uniform(1, Datum_Count+1) || _ <- lists:seq(1, Num_Desired)],
-    Rand_Fn = fun(_Ets_Entry, {Pids, Ets_Item_Pos, []}) -> {Pids, Ets_Item_Pos+1, []};
+    Rand_Fn = fun(_Ets_Entry, {Pids, Ets_Item_Pos, []})   -> {Pids, Ets_Item_Pos+1, []};
                  ({_UseKey, Datum_Pid, _Size}, {Pids, Ets_Item_Pos, Wanted_Pid_Positions}) ->
                       Fetch_Positions = lists:takewhile(fun(Pos) -> Pos =:= Ets_Item_Pos end, Wanted_Pid_Positions),
                       Fetch_Pids = lists:duplicate(length(Fetch_Positions), Datum_Pid),
@@ -266,7 +288,7 @@ handle_info({'DOWN', _Ref, process, DatumPid, _Reason},
   end,
 
   %% There can only be 1 entry in an ets 'set' table, so don't scan full table.
-  New_State = delete_one_ets_entry_by_pid(DatumIndex, DatumPid, State),
+  New_State = delete_one_entry_by_pid(DatumIndex, DatumPid, State),
   {noreply, New_State};
 
 handle_info(_Info, State) ->
@@ -278,12 +300,19 @@ handle_info(_Info, State) ->
 %% Private
 %% ===================================================================
 
-delete_one_ets_entry_by_pid(DatumIndex, DatumPid, #cache{index_type = Index_Type, cache_used = Used} = State) ->
+delete_one_entry_by_pid(DatumIndex, DatumPid, #cache{index_type = pdict, cache_used = Used} = State) ->
+    case [Val || {_Key, [{_Key, Pid, _Size} = Val]} <- get(), Pid =:= DatumPid] of
+        [] -> State;
+        [{Key, DatumPid, Size}] ->
+            index_delete(pdict, DatumIndex, Key),
+            State#cache{cache_used = Used - Size}
+    end;
+delete_one_entry_by_pid(DatumIndex, DatumPid, #cache{index_type = ets, cache_used = Used} = State) ->
     case ets:match_object(DatumIndex, {'_', DatumPid, '_'}, 1) of
         '$end_of_table' -> State;
         {[], _Cont_Fn}  -> State; 
         {[{UseKey, DatumPid, Size}], _Cont_Fn} ->
-            index_delete(Index_Type, DatumIndex, UseKey),
+            index_delete(ets, DatumIndex, UseKey),
             State#cache{cache_used = Used - Size}
     end.
 
@@ -291,7 +320,7 @@ get_age(DatumPid) ->
     Ref = make_ref(),
     DatumPid ! {last_active, Ref, self()},
     receive {last_active, Ref, DatumPid, Last_Active} -> {Last_Active, DatumPid}
-    after 50 -> no_response
+    after 100 -> no_response
     end.
     
 filter_oldest(_Ref, 0, _Oldest_Active, Oldest_Pid) -> Oldest_Pid;
@@ -310,7 +339,7 @@ get_data(DatumPid, Timeout) ->
   Ref = make_ref(),
   DatumPid ! {get, Ref, self()},
   receive {get, Ref, DatumPid, Data} -> {ok, Data}
-  after Timeout -> {no_data, timeout}
+  after Timeout -> no_data
   end.
 
 get_key(DatumPid) -> get_key(DatumPid, 100).
@@ -318,7 +347,7 @@ get_key(DatumPid, Timeout) ->
   Ref = make_ref(),
   DatumPid ! {getkey, Ref, self()},
   receive {getkey, Ref, DatumPid, Key} -> {ok, Key}
-  after Timeout -> {no_data, timeout}
+  after Timeout -> no_data
   end.
 
 -record(datum, {
@@ -441,7 +470,7 @@ datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
 
     {destroy, Ref, From} ->
       From ! {destroy, Ref, self(), ok},
-      % io:format("destroying ~p with last access of ~p~n", [self(), LastActive]),
+      %% error_logger:error_msg("destroying ~p with last access of ~p~n", [self(), LastActive]),
       exit(self(), destroy);
 
     %% Request to expire if less than Pct_TTL_Remaining...
@@ -469,9 +498,9 @@ datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
 
   after
     TTL ->
+        %% INSERT STATS COLLECTION INFO HERE
+        %% error_logger:error_msg("Cache object ~p owned by ~p freed~n", [Key, self()]),
       cache_is_now_dead
-        % INSERT STATS COLLECTION INFO HERE
-        % io:format("Cache object ~p owned by ~p freed~n", [Key, self()])
   end.
 
 
@@ -479,39 +508,23 @@ datum_loop(#datum{key = Key, mgr = Mgr, last_active = LastActive,
 %%% Generalize index for datum pids to allow alternatives to ets
 %%%----------------------------------------------------------------------
 
-create_index(ets,    Name) -> ets:new(Name, [set, private]);
-create_index(pdict, _Name) -> pdict.
+create_index(pdict, _Name) -> pdict;
+create_index(ets,    Name) -> ets:new(Name, [named_table, set, protected,
+                                             {read_concurrency, true}]).
 
-index_count(ets, Ets_Table) -> ets:info(Ets_Table, size);
-index_count(pdict, pdict)   -> length(get()).   %% This is very inefficient
+index_count(pdict,  pdict)     -> length(get());   %% This is very inefficient
+index_count(ets,    Ets_Table) -> ets:info(Ets_Table, size).
 
-index_insert(ets, Datum_Index, _Key, Value) -> ets:insert(Datum_Index, Value);
-index_insert(pdict, pdict, Key, Value)      -> put(Key, Value), true.
+index_insert(pdict, pdict,        Key, Value) -> put(Key, [Value]), true;
+index_insert(ets,   Datum_Index, _Key, Value) -> ets:insert(Datum_Index, Value).
 
-index_lookup(ets, Datum_Index, Key) -> ets:lookup(Datum_Index, Key);
-index_lookup(pdict, pdict, Key)     -> get(Key).
+index_lookup(pdict, pdict,       Key) -> case get(Key) of undefined -> []; Value -> Value end;
+index_lookup(ets,   Datum_Index, Key) -> ets:lookup(Datum_Index, Key).
 
-index_delete(ets, Datum_Index, Key) -> ets:delete(Datum_Index, Key);
-index_delete(pdict, pdict, Key)     -> erase(Key), true.
+index_delete(pdict, pdict,       Key) -> erase(Key), true;
+index_delete(ets,   Datum_Index, Key) -> ets:delete(Datum_Index, Key).
 
-index_foldl(ets, Fun, Init_Acc, Datum_Index) ->
-    ets:foldl(Fun, Init_Acc, Datum_Index);
-index_foldl(pdict, Fun, Init_Acc, pdict) ->
-    lists:foldl(Fun, Init_Acc, get()).
-
-%% index_delete_by_pid(Datum_Index, Datum_Pid, #cache{index_type=ets, cache_used = Used} = State) ->
-%%     case ets:match_object(Datum_Index, {'_', Datum_Pid, '_'}, 1) of
-%%         '$end_of_table' -> State;
-%%         {[], _Cont_Fn}  -> State; 
-%%         {[{Use_Key, Datum_Pid, Size}], _Cont_Fn} ->
-%%             ets:delete(Datum_Index, Use_Key),
-%%             State#cache{cache_used = Used - Size}
-%%     end;
-%% index_delete_by_pid(_Datum_Index, Datum_Pid, #cache{index_type=pdict, cache_used = Used} = State) ->
-%%     case get(Datum_Pid) of
-%%         undefined -> State;
-%%         Key       -> {Use_Key, Datum_Pid, Size} = get(Key),
-%%                      erase(Datum_Pid),
-%%                      erase(Key),
-%%                      State#cache{cache_used = Used - Size}
-%%     end.
+index_foldl(ets,    Fun, Init_Acc, Datum_Index) -> ets:foldl(Fun, Init_Acc, Datum_Index);
+index_foldl(pdict,  Fun, Init_Acc, pdict) ->
+    Terms = [V || {K,[V]} <- get(), K =/= '$ancestors', K =/= '$initial_call'],
+    lists:foldl(Fun, Init_Acc, Terms).
