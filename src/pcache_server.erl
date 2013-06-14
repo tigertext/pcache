@@ -89,12 +89,12 @@ init({Name, Mod, Fun, CacheSize, CacheTime, CachePolicy, Index_Type})
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
 terminate(_Reason, _State) -> ok.
 
-locate(DatumKey, #cache{index_type = Index_Type, datum_index = DatumIndex, data_module = DataModule,
+locate(DatumKey, #cache{name = Name, index_type = Index_Type, datum_index = DatumIndex, data_module = DataModule,
                         default_ttl = DefaultTTL, cache_policy = Policy, data_accessor = DataAccessor}) ->
   UseKey = key(DatumKey),
   case index_lookup(Index_Type, DatumIndex, UseKey) of 
     [{UseKey, Pid, _Size}] when is_pid(Pid) -> Pid;
-    [] -> launch_datum(Index_Type, DatumKey, UseKey, DatumIndex, DataModule, DataAccessor, DefaultTTL, Policy)
+    [] -> launch_datum(Name, Index_Type, DatumKey, UseKey, DatumIndex, DataModule, DataAccessor, DefaultTTL, Policy)
   end.
 
 locate_memoize(Index_Type, DatumKey, DatumIndex, DataModule, DataAccessor, DefaultTTL, Policy) ->
@@ -375,11 +375,13 @@ make_new_datum(Cache_Server, Key, UseKey, Module, Accessor, TTL, CachePolicy) ->
             exit(crashed)
     end.
 
-launch_datum(Index_Type, DatumKey, UseKey, DatumIndex, Module, Accessor, TTL, CachePolicy) ->
+launch_datum(Name, Index_Type, DatumKey, UseKey, DatumIndex, Module, Accessor, TTL, CachePolicy) ->
   Datum_Args = [self(), DatumKey, UseKey, Module, Accessor, TTL, CachePolicy],
-  {Datum_Pid, _Monitor} = erlang:spawn_monitor(?MODULE, datum_launch, Datum_Args),
-  index_insert(Index_Type, DatumIndex, UseKey, {UseKey, Datum_Pid, 0}),
-  Datum_Pid.
+  case esp_cxy_ctl:execute_pid(Name, pcache_server, datum_launch, Datum_Args) of
+      {inline, _Cache_Data}            -> skip;  %% This should never happen! Set cxy limit to 1M.
+      Datum_Pid when is_pid(Datum_Pid) -> index_insert(Index_Type, DatumIndex, UseKey, {UseKey, Datum_Pid, 0}),
+                                          Datum_Pid
+  end.
 
 launch_memoize_datum(Index_Type, DatumKey, UseKey, DatumIndex, Module, Accessor, TTL, CachePolicy) ->
   Datum_Args = [self(), DatumKey, UseKey, Module, Accessor, TTL, CachePolicy],
