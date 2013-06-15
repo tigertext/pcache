@@ -379,7 +379,8 @@ launch_datum(Name, Index_Type, DatumKey, UseKey, DatumIndex, Module, Accessor, T
   Datum_Args = [self(), DatumKey, UseKey, Module, Accessor, TTL, CachePolicy],
   case esp_cxy_ctl:execute_pid(Name, pcache_server, datum_launch, Datum_Args) of
       {inline, _Cache_Data}            -> skip;  %% This should never happen! Set cxy limit to 1M.
-      Datum_Pid when is_pid(Datum_Pid) -> index_insert(Index_Type, DatumIndex, UseKey, {UseKey, Datum_Pid, 0}),
+      Datum_Pid when is_pid(Datum_Pid) -> erlang:monitor(process, Datum_Pid),
+                                          index_insert(Index_Type, DatumIndex, UseKey, {UseKey, Datum_Pid, 0}),
                                           Datum_Pid
   end.
 
